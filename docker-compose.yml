@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: crow-app
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    depends_on:
+      - database
+    environment:
+      - LOG_LEVEL=info
+      # Asegúrate de que tu app use estos valores para conectar
+      - DB_HOST=database
+      - DB_PORT=5432
+      - DB_USER=crowuser
+      - DB_PASSWORD=crowpassword
+      - DB_NAME=crowdb
+
+  database:
+    image: postgres:13
+    container_name: crow-db
+    environment:
+      - POSTGRES_USER=crowuser
+      - POSTGRES_PASSWORD=crowpassword
+      - POSTGRES_DB=crowdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    
+  adminer:
+    image: adminer
+    container_name: crow-adminer
+    ports:
+      - "8081:8080"
+    restart: unless-stopped
+
+volumes:
+  db_data:
