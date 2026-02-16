@@ -3,11 +3,13 @@ version: '3.8'
 services:
   backend:
     build:
-      context: ./backend
+      context: .
       dockerfile: Dockerfile
     container_name: crow-app
     ports:
       - "8080:8080"
+    volumes:
+     - ./backend/src/frontend:/app/static
     restart: unless-stopped
     depends_on:
       - database
