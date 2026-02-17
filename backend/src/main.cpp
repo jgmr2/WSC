@@ -2,6 +2,7 @@
 
 int main()
 {
+
     crow::SimpleApp app;
 
     // En Crow, para servir archivos estáticos se usa esto:
@@ -13,7 +14,7 @@ int main()
         res.set_static_file_info("static_assets/index.html");
         res.end();
     });
-
+    
     // Esta ruta comodín permite que Svelte cargue sus JS, CSS y el WASM
     // Crow servirá cualquier archivo que esté dentro de la carpeta "static"
     CROW_ROUTE(app, "/<path>")
