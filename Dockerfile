@@ -1,8 +1,29 @@
-### ETAPA 1: COMPILACIÓN DE LÓGICA EN C++ A WEBASSEMBLY (WASM)
+### ETAPA 1: Entorno de compilación para Motor LaTeX Real
 FROM emscripten/emsdk:latest as wasm-build
+
+# Instalamos dependencias del sistema necesarias para motores tipográficos (Fuentes y Gráficos)
+# pkg-config es vital para que emcc encuentre las librerías
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libfontconfig1-dev \
+    libfreetype6-dev \
+    libpng-dev \
+    zlib1g-dev \
+    python3
+
 WORKDIR /app
+
+# Paso crítico: Clonamos e instalamos libHaru o una versión ligera de un motor TeX
+# Aquí usaremos libHaru como motor de salida PDF profesional
+RUN git clone https://github.com/libharu/libharu.git && \
+    cd libharu && \
+    mkdir build && cd build && \
+    emcmake cmake .. -DHPDF_SHARED=OFF -DHPDF_STATIC=ON && \
+    emmake make install
+
 COPY ./wasm ./wasm
 WORKDIR /app/wasm
+
 RUN cd src && make
 
 ### ETAPA 2: CONSTRUCCIÓN DEL FRONTEND (SVELTE + BUN)

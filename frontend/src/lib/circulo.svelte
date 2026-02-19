@@ -10,7 +10,7 @@
     try {
       // Cargamos el pegamento de Emscripten desde /static/logic.js
       // Usamos import dinámico para que Vite no intente procesarlo
-      const modulePath = '/logic.js';
+      const modulePath = '/main.js';
       const { default: initWasm } = await import(/* @vite-ignore */ modulePath);
       
       // Inicializamos
@@ -83,7 +83,7 @@
     height: 150px;
     background: #eee;
     border-radius: 50%;
-    animation: pulse 1.5s infinite;
+    animation: pulse .5s infinite;
   }
 
   @keyframes pulse {

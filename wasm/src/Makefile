@@ -1,31 +1,42 @@
-# Nombre del archivo de salida
-TARGET = logic.js
-
-# Compilador de Emscripten
+# Nombre del compilador
 CC = emcc
 
-# Fuentes
-SOURCES = main.cpp
+# Directorios
+SRC_DIR = .
+OUT_DIR = ../dist
 
-# Flags de optimización y configuración de WASM
-# -O3: Optimización máxima de tamaño/rendimiento
-# -s WASM=1: Indica que queremos generar un binario .wasm
-# -s EXPORTED_RUNTIME_METHODS: Permite llamar funciones desde JS
-# -s MODULARIZE=1: Envuelve el código en una función para cargarlo fácilmente
-# -s EXPORT_ES6=1: Genera un módulo compatible con Svelte/Vite
-LDFLAGS = -O3 \
-          -s WASM=1 \
-          -s MODULARIZE=1 \
-          -s EXPORT_ES6=1 \
-          -s "EXPORTED_RUNTIME_METHODS=['ccall','cwrap']" \
-          -s ALLOW_MEMORY_GROWTH=1
+# Apuntamos a la carpeta donde se compiló libharu en la Etapa 1
+# Basado en tu Dockerfile: /app/libharu/build/src/libhpdf.a
+LIBHARU_PATH = /app/libharu
+INCLUDES = -I$(LIBHARU_PATH)/include -I$(LIBHARU_PATH)/build/include
+LIBHPDF_A = $(LIBHARU_PATH)/build/src/libhpdf.a
 
-# Regla principal
-all: $(TARGET)
+EM_FLAGS = -O3 \
+           --bind \
+           $(INCLUDES) \
+           -s WASM=1 \
+           -s MODULARIZE=1 \
+           -s EXPORT_ES6=1 \
+           -s ALLOW_MEMORY_GROWTH=1 \
+           -s FORCE_FILESYSTEM=1 \
+           -s EXPORTED_RUNTIME_METHODS="['ccall','cwrap','FS']" \
+           -s NO_EXIT_RUNTIME=1 \
+           -s ENVIRONMENT='web' \
+           -s USE_ZLIB=1 \
+           -s USE_LIBPNG=1
 
-$(TARGET): $(SOURCES)
-	mkdir -p ../dist
-	$(CC) $(SOURCES) -o ../dist/$(TARGET) $(LDFLAGS)
+# Buscar todos los .cpp
+SOURCES = $(wildcard $(SRC_DIR)/*.cpp)
+TARGETS = $(patsubst $(SRC_DIR)/%.cpp, $(OUT_DIR)/%.js, $(SOURCES))
+
+.PHONY: all clean
+
+all: $(TARGETS)
+
+# Regla de compilación
+$(OUT_DIR)/%.js: $(SRC_DIR)/%.cpp
+	@mkdir -p $(OUT_DIR)
+	$(CC) $< $(LIBHPDF_A) $(EM_FLAGS) -o $@
 
 clean:
-	rm -rf ../dist
+	rm -rf $(OUT_DIR)

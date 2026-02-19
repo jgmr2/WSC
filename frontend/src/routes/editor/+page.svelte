@@ -1,5 +1,5 @@
 <script>
-  import Editor from "../lib/editor.svelte";
+  import Editor from "../../lib/editor.svelte";
 </script>
 
 <svelte:head>
