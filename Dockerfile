@@ -1,5 +1,5 @@
 ### ETAPA 1: Entorno de compilación para Motor LaTeX Real
-FROM emscripten/emsdk:latest as wasm-build
+FROM emscripten/emsdk:latest AS wasm-build
 
 # Instalamos dependencias del sistema necesarias para motores tipográficos (Fuentes y Gráficos)
 # pkg-config es vital para que emcc encuentre las librerías
@@ -27,7 +27,7 @@ WORKDIR /app/wasm
 RUN cd src && make
 
 ### ETAPA 2: CONSTRUCCIÓN DEL FRONTEND (SVELTE + BUN)
-FROM oven/bun:1.1-alpine as svelte-build
+FROM oven/bun:1.1-alpine AS svelte-build
 WORKDIR /app
 COPY ./frontend/package.json ./frontend/bun.lockb* ./
 RUN bun install --frozen-lockfile
@@ -38,7 +38,7 @@ COPY --from=wasm-build /app/wasm/dist/*.js ./static/
 RUN bun run build
 
 ### ETAPA 3: COMPILACIÓN DEL BACKEND (C++ CROW & POSTGRESQL)
-FROM alpine:latest as build
+FROM alpine:latest AS build
 RUN apk add --no-cache \
     build-base \
     cmake \
@@ -65,7 +65,7 @@ RUN cd src && make
 COPY --from=svelte-build /app/build ./src/static_assets
 
 ### ETAPA 4: IMAGEN DE PRODUCCIÓN FINAL (RUNTIME ULTRA-LIGERO)
-FROM scratch as runtime
+FROM scratch AS runtime
 COPY --from=build /app/build/app /bin/app
 COPY --from=build /app/src/static_assets /static_assets
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/

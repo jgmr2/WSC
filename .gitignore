@@ -1,0 +1,5 @@
+# --- SEGURIDAD ---
+# Archivo de configuración local con credenciales
+.env
+.env.*
+!.env.example

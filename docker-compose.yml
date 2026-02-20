@@ -7,42 +7,40 @@ services:
       dockerfile: Dockerfile
     container_name: crow-app
     ports:
-      - "80:8080"
+      - "${PORT_HTTP:-80}:8080"
     volumes:
      - ./backend/src/frontend:/app/static
     restart: unless-stopped
     depends_on:
       - database
-    # --- CONFIGURACIÓN DE LÍMITES ---
     deploy:
       resources:
         limits:
-          memory: 16M
-          cpus: '1' # Opcional: limita a medio núcleo para evitar picos de CPU
+          memory: ${BACKEND_MEMORY_LIMIT:-16M}
+          cpus: '1' 
         reservations:
-          memory: 10M
-    # --------------------------------
+          memory: ${BACKEND_RESERVATIONS:-10M}
     environment:
       - LOG_LEVEL=info
       - DB_HOST=database
-      - DB_PORT=5432
-      - DB_USER=crowuser
-      - DB_PASSWORD=crowpassword
-      - DB_NAME=crowdb
+      - DB_PORT=${DB_PORT}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_NAME=${DB_NAME}
 
   database:
-    image: postgres:13-alpine # Te sugiero alpine para reducir el peso
+    image: postgres:13-alpine
     container_name: crow-db
     environment:
-      - POSTGRES_USER=crowuser
-      - POSTGRES_PASSWORD=crowpassword
-      - POSTGRES_DB=crowdb
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=${DB_NAME}
     deploy:
       resources:
         limits:
-          memory: 256M # Postgres sí necesita un poco de aire para respirar
+          memory: ${DB_MEMORY_LIMIT:-256M} 
     ports:
-      - "5432:5432"
+      - "${DB_PORT}:5432"
     volumes:
       - db_data:/var/lib/postgresql/data
     restart: unless-stopped
@@ -51,7 +49,7 @@ services:
     image: adminer
     container_name: crow-adminer
     ports:
-      - "8081:8080"
+      - "${PORT_ADMINER:-8081}:8080"
     restart: unless-stopped
 
 volumes:
