@@ -1,40 +1,35 @@
-### ETAPA 1: Entorno de compilación para Motor LaTeX Real
+### ETAPA 1: Entorno de compilación para Motor WASM (Estadística Matemática)
 FROM emscripten/emsdk:latest AS wasm-build
-
-# Instalamos dependencias del sistema necesarias para motores tipográficos (Fuentes y Gráficos)
-# pkg-config es vital para que emcc encuentre las librerías
 RUN apt-get update && apt-get install -y \
-    pkg-config \
-    libfontconfig1-dev \
-    libfreetype6-dev \
-    libpng-dev \
-    zlib1g-dev \
-    python3
-
+    build-essential \
+    cmake \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-
-# Paso crítico: Clonamos e instalamos libHaru o una versión ligera de un motor TeX
-# Aquí usaremos libHaru como motor de salida PDF profesional
-RUN git clone https://github.com/libharu/libharu.git && \
-    cd libharu && \
-    mkdir build && cd build && \
-    emcmake cmake .. -DHPDF_SHARED=OFF -DHPDF_STATIC=ON && \
-    emmake make install
-
 COPY ./wasm ./wasm
 WORKDIR /app/wasm
-
 RUN cd src && make
 
 ### ETAPA 2: CONSTRUCCIÓN DEL FRONTEND (SVELTE + BUN)
-FROM oven/bun:1.1-alpine AS svelte-build
+FROM oven/bun:1.2-slim AS svelte-build
 WORKDIR /app
+
+# 1. Instalar dependencias primero (Caché de capas)
 COPY ./frontend/package.json ./frontend/bun.lockb* ./
 RUN bun install --frozen-lockfile
+
+# 2. Copiar el resto del código del frontend
 COPY ./frontend ./
-# Se integran los binarios WASM generados en la Etapa 1
+
+# 3. CAMBIO CLAVE: Copiar modelos locales en lugar de descargarlos
+# Asumiendo que están en frontend/static/models en tu host
+COPY ./frontend/static/models/ ./static/models/
+
+# 4. Copiar artefactos de WASM a la carpeta static
 COPY --from=wasm-build /app/wasm/dist/*.wasm ./static/
 COPY --from=wasm-build /app/wasm/dist/*.js ./static/
+
+RUN bun x svelte-kit sync
 RUN bun run build
 
 ### ETAPA 3: COMPILACIÓN DEL BACKEND (C++ CROW & POSTGRESQL)
@@ -51,6 +46,8 @@ RUN apk add --no-cache \
     asio-dev \
     postgresql-dev \
     nlohmann-json
+
+# Instalación de librerías de C++ (Crow y JWT)
 RUN git clone --depth 1 https://github.com/CrowCpp/Crow.git /tmp/crow && \
     mkdir -p /usr/local/include && \
     cp -r /tmp/crow/include/* /usr/local/include/ && \
@@ -58,10 +55,11 @@ RUN git clone --depth 1 https://github.com/CrowCpp/Crow.git /tmp/crow && \
 RUN git clone https://github.com/Thalhammer/jwt-cpp.git /tmp/jwt && \
     cp -r /tmp/jwt/include/* /usr/local/include/ && \
     rm -rf /tmp/jwt
+
 WORKDIR /app
 COPY ./backend/src ./src
 RUN cd src && make
-# Se integra el bundle de Svelte generado en la Etapa 2
+# Traemos el build de Svelte
 COPY --from=svelte-build /app/build ./src/static_assets
 
 ### ETAPA 4: IMAGEN DE PRODUCCIÓN FINAL (RUNTIME ULTRA-LIGERO)

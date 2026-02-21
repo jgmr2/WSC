@@ -3,18 +3,18 @@ import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
 
 /** @type {import('@sveltejs/kit').Config} */
 const config = {
-	preprocess: vitePreprocess(),
-	kit: {
-		// adapter-auto solo funciona en entornos específicos, 
-		// adapter-static genera la carpeta 'build'
-		adapter: adapter({
-			pages: 'build',
-			assets: 'build',
-			fallback: 'index.html', // Recomendado para Single Page Apps (SPA)
-			precompress: false,
-			strict: true
-		})
-	}
+    preprocess: vitePreprocess(),
+    compilerOptions: {
+        runes: true // Necesario para $state
+    },
+    kit: {
+        adapter: adapter({
+            pages: 'build',
+            assets: 'build',
+            fallback: 'index.html', // Crucial para Crow y SPA
+            strict: true
+        })
+    }
 };
 
 export default config;
