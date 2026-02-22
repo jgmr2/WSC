@@ -16,7 +16,6 @@ WORKDIR /app
 COPY ./frontend/package.json ./frontend/bun.lockb* ./
 RUN bun install --frozen-lockfile
 COPY ./frontend ./
-COPY ./frontend/static/models/ ./static/models/
 COPY --from=wasm-build /app/wasm/dist/*.wasm ./static/
 COPY --from=wasm-build /app/wasm/dist/*.js ./static/
 RUN bun x svelte-kit sync

@@ -1,187 +1,233 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import * as faceapi from '@vladmandic/face-api';
 
   // --- ESTADOS CON RUNES (SVELTE 5) ---
-  let videoElement: HTMLVideoElement = $state();
+  let videoElement = $state<HTMLVideoElement | null>(null);
   let status = $state("SISTEMA INICIANDO...");
-  let points = $state([]); 
+  let points = $state<{x: number, y: number}[]>([]); 
   let eyesLocked = $state(false);
   let blinkCount = $state(0);
-  let authorizedUser = $state(null);
-  let lastEar = 0; 
+  let authorizedUser = $state<any>(null);
   let faceBox = $state({ x: 0, y: 0, w: 0, h: 0 }); 
   let leftCircle = $state({ x: 38, y: 45, active: false });
   let rightCircle = $state({ x: 62, y: 45, active: false });
 
-  // --- INTEGRACIÓN DEL MOTOR WASM ---
+  // --- INTEGRACIÓN MEDIA PIPE Y WASM ---
+  let faceLandmarker: any;
+  let wasmEngine: any = null;
+  let isBlinking = false; // Estado local para control de parpadeo
+  
   const wasmPath = '/camara.js';
-  let wasmEngine: any = null; // Guardaremos la instancia aquí
-
-  // Cargamos el módulo
-  const motorPromise = import(/* @vite-ignore */ wasmPath)
-    .then(m => m.default({ locateFile: p => `/${p}` }));
-
   const DB_KEY = "BIOMETRIC_LOCAL_DB";
 
-  /**
-   * UTILIDAD PARA PASAR DATOS A C++
-   * Convierte los puntos de JS en un puntero del HEAP de WASM
-   */
+  // Promesa para cargar tu motor C++
+  const motorPromise = import(/* @vite-ignore */ wasmPath)
+    .then(m => m.default({ locateFile: (p: string) => `/${p}` }));
+
+  onMount(async () => {
+    try {
+      // 1. Carga dinámica de MediaPipe para evitar errores de SSR en el Build
+      const mpTasks = await import("@mediapipe/tasks-vision");
+      const { FaceLandmarker, FilesetResolver } = mpTasks;
+
+      // 2. Inicializar WASM de C++ y Resolvers en paralelo
+      const [engine, filesetResolver] = await Promise.all([
+        motorPromise,
+        FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm")
+      ]);
+
+      wasmEngine = engine;
+
+      // 3. Configurar Landmarker
+      faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+        baseOptions: {
+          modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task`,
+          delegate: "GPU"
+        },
+        outputFaceBlendshapes: true,
+        runningMode: "VIDEO",
+        numFaces: 1
+      });
+
+      status = "MOTOR BIOMÉTRICO ONLINE";
+      
+      // 4. Iniciar cámara SOLO si el elemento ya existe
+      if (videoElement) {
+        await setupCamera();
+      }
+    } catch (e) {
+      status = "ERROR DE INICIALIZACIÓN";
+      console.error(e);
+    }
+  });
+
+  async function setupCamera() {
+    if (!videoElement) return;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { width: 1280, height: 720 } 
+      });
+      
+      videoElement.srcObject = stream;
+      
+      // Esperar a que el video esté listo para procesar
+      videoElement.onloadedmetadata = () => {
+        videoElement?.play();
+        predict();
+      };
+    } catch (err) {
+      status = "ERROR: ACCESO A CÁMARA DENEGADO";
+    }
+  }
+
+  async function predict() {
+    if (!videoElement || !faceLandmarker || videoElement.paused) return;
+
+    const startTimeMs = performance.now();
+    const results = faceLandmarker.detectForVideo(videoElement, startTimeMs);
+
+    if (results.faceLandmarks && results.faceLandmarks.length > 0) {
+      const landmarks = results.faceLandmarks[0];
+      const blendShapes = results.faceBlendshapes[0]?.categories || [];
+
+      processFaceData(landmarks, blendShapes);
+      eyesLocked = true;
+    } else {
+      eyesLocked = false;
+      leftCircle.active = false;
+      rightCircle.active = false;
+    }
+
+    requestAnimationFrame(predict);
+  }
+
+  function processFaceData(landmarks: any[], blendShapes: any[]) {
+    // MediaPipe 478 puntos normalizados a %
+    points = landmarks.map(p => ({ x: p.x * 100, y: p.y * 100 }));
+
+    // Bounding Box para el UI
+    const xs = landmarks.map(p => p.x);
+    const ys = landmarks.map(p => p.y);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+
+    faceBox = {
+      x: minX * 100,
+      y: minY * 100,
+      w: (maxX - minX) * 100,
+      h: (maxY - minY) * 100
+    };
+
+    // Tracking de Iris (MediaPipe indices 468 y 473)
+    leftCircle = { x: landmarks[468].x * 100, y: landmarks[468].y * 100, active: true };
+    rightCircle = { x: landmarks[473].x * 100, y: landmarks[473].y * 100, active: true };
+
+    // Detección de parpadeo vía Blendshapes
+    const blinkL = blendShapes.find(s => s.categoryName === "eyeBlinkLeft")?.score || 0;
+    const blinkR = blendShapes.find(s => s.categoryName === "eyeBlinkRight")?.score || 0;
+    
+    if (blinkL > 0.5 && blinkR > 0.5) {
+        if (!isBlinking) {
+            isBlinking = true;
+            blinkCount++;
+            if (blinkCount >= 2 && !authorizedUser) handleBiometricCheck();
+        }
+    } else {
+        isBlinking = false;
+    }
+  }
+
   function getWasmHash(currentPoints: any[]) {
-    if (!wasmEngine) return null;
-
-    // 1. Crear un Float32Array plano [x1, y1, x2, y2...]
+    if (!wasmEngine || currentPoints.length === 0) return null;
     const flatCoords = new Float32Array(currentPoints.flatMap(p => [p.x, p.y]));
-    
-    // 2. Reservar memoria en el motor (4 bytes por float)
     const ptr = wasmEngine._malloc(flatCoords.length * 4);
-    
-    // 3. Escribir los datos en el HEAP
     wasmEngine.HEAPF32.set(flatCoords, ptr >> 2);
-
-    // 4. Llamar a tu función de C++ (ajusta el nombre según tu .cpp)
-    // Asumimos que genera un string o un valor numérico único
     const hash = wasmEngine.generate_geometric_hash(ptr, currentPoints.length);
-
-    // 5. Liberar memoria para evitar fugas
     wasmEngine._free(ptr);
-    
     return hash;
   }
 
   async function handleBiometricCheck() {
-    if (!wasmEngine) {
-        status = "ERROR: MOTOR NO LISTO";
-        return;
-    }
-
-    status = "PROCESANDO WASM...";
+    if (!wasmEngine) return;
+    status = "VALIDANDO GEOMETRÍA...";
     
-    // Generamos la firma usando C++
     const currentHash = getWasmHash(points);
+    const db = JSON.parse(localStorage.getItem(DB_KEY) || "[]");
     
-    const rawData = localStorage.getItem(DB_KEY);
-    const db = rawData ? JSON.parse(rawData) : [];
-    
-    // COMPARACIÓN VÍA WASM
-    // Usamos el motor para comparar la firma actual con las guardadas
-    const match = db.find(user => {
-        // Asumimos que tu motor tiene una función de similitud
-        const score = wasmEngine.get_similarity(currentHash, user.hash);
-        return score > 0.85; // Umbral de precisión
-    });
+    const match = db.find((user: any) => wasmEngine.get_similarity(currentHash, user.hash) > 0.85);
 
     if (match) {
       authorizedUser = match;
-      status = "ACCESO AUTORIZADO (WASM)";
+      status = "IDENTIDAD CONFIRMADA";
     } else {
       const thumb = await captureThumb();
-      
       const newUser = {
         name: `SUJETO_${db.length + 101}`,
-        hash: currentHash, // El hash generado por C++
+        hash: currentHash,
         photo: thumb,
         timestamp: new Date().toLocaleString()
       };
-
       db.push(newUser);
       localStorage.setItem(DB_KEY, JSON.stringify(db));
       authorizedUser = newUser;
-      status = "NUEVA IDENTIDAD REGISTRADA";
+      status = "NUEVO REGISTRO CREADO";
     }
   }
-
-  // --- CARGA Y PROCESAMIENTO ---
-
-  async function loadIA() {
-    try {
-      // Esperamos a que el motor WASM esté instanciado
-      wasmEngine = await motorPromise;
-      
-      await faceapi.nets.tinyFaceDetector.loadFromUri('/models');
-      await faceapi.nets.faceLandmark68Net.loadFromUri('/models');
-      status = "MOTOR WASM ONLINE";
-      
-      setInterval(() => {
-        if (!authorizedUser) processFrame();
-      }, 80);
-    } catch (e) {
-      status = "ERROR DE CARGA";
-      console.error(e);
-    }
-  }
-
-  // ... (Funciones processFrame y captureThumb se mantienen igual) ...
-
-  async function processFrame() {
-    if (!videoElement || videoElement.readyState < 2) return;
-    const detection = await faceapi.detectSingleFace(videoElement, new faceapi.TinyFaceDetectorOptions()).withFaceLandmarks();
-    if (!detection) { eyesLocked = false; return; }
-
-    const landmarks = detection.landmarks;
-    const box = detection.detection.box;
-    
-    faceBox = {
-      x: (box.x / videoElement.videoWidth) * 100,
-      y: (box.y / videoElement.videoHeight) * 100,
-      w: (box.width / videoElement.videoWidth) * 100,
-      h: (box.height / videoElement.videoHeight) * 100
-    };
-
-    const lEye = landmarks.getLeftEye();
-    const rEye = landmarks.getRightEye();
-
-    leftCircle = {
-      x: (lEye.reduce((a, b) => a + b.x, 0) / 6 / videoElement.videoWidth) * 100,
-      y: (lEye.reduce((a, b) => a + b.y, 0) / 6 / videoElement.videoHeight) * 100,
-      active: true
-    };
-
-    rightCircle = {
-      x: (rEye.reduce((a, b) => a + b.x, 0) / 6 / videoElement.videoWidth) * 100,
-      y: (rEye.reduce((a, b) => a + b.y, 0) / 6 / videoElement.videoHeight) * 100,
-      active: true
-    };
-
-    eyesLocked = true;
-    points = landmarks.positions.map(p => ({
-      x: (p.x / videoElement.videoWidth) * 100,
-      y: (p.y / videoElement.videoHeight) * 100
-    }));
-
-    const ear = (() => {
-        const d = (p1, p2) => Math.sqrt(Math.pow(p1.x-p2.x,2) + Math.pow(p1.y-p2.y,2));
-        const eyeEar = (p) => (d(p[1],p[5]) + d(p[2],p[4])) / (2 * d(p[0],p[3]));
-        return (eyeEar(lEye) + eyeEar(rEye)) / 2;
-    })();
-
-    if (lastEar > 0.25 && ear < 0.18) {
-      blinkCount++;
-      if (blinkCount >= 2) handleBiometricCheck();
-    }
-    lastEar = ear;
-  }
-
-  onMount(() => {
-    navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } })
-      .then(s => { 
-        videoElement.srcObject = s; 
-        loadIA(); 
-      });
-  });
 
   async function captureThumb(): Promise<string> {
     const canvas = document.createElement('canvas');
     canvas.width = 160; canvas.height = 160;
     const ctx = canvas.getContext('2d');
-    if (videoElement) ctx.drawImage(videoElement, 0, 0, 160, 160);
+    if (videoElement && ctx) ctx.drawImage(videoElement, 0, 0, 160, 160);
     return canvas.toDataURL('image/jpeg', 0.7);
   }
-</script>
 
+  function getCorrectedCoords(p: {x: number, y: number}) {
+  if (!videoElement) return { x: 0, y: 0 };
+
+  const displayW = videoElement.offsetWidth;
+  const displayH = videoElement.offsetHeight;
+  const videoW = videoElement.videoWidth;
+  const videoH = videoElement.videoHeight;
+
+  const videoAspect = videoW / videoH;
+  const displayAspect = displayW / displayH;
+
+  let renderW, renderH;
+  let offsetX = 0;
+  let offsetY = 0;
+
+  // Lógica exacta de object-fit: cover
+  if (videoAspect > displayAspect) {
+    // El video es más ancho: se ajusta al alto y se corta de los lados
+    renderH = displayH;
+    renderW = displayH * videoAspect;
+    offsetX = (renderW - displayW) / 2;
+  } else {
+    // El video es más alto: se ajusta al ancho y se corta arriba/abajo
+    renderW = displayW;
+    renderH = displayW / videoAspect;
+    offsetY = (renderH - displayH) / 2;
+  }
+
+  // Convertimos la coordenada normalizada (0-1) a píxeles de renderizado
+  // (1 - p.x) para compensar el scaleX(-1) del CSS
+  const xPx = (1 - p.x) * renderW - offsetX;
+  const yPx = p.y * renderH - offsetY;
+
+  // Devolvemos en porcentaje respecto al contenedor visible
+  return { 
+    x: (xPx / displayW) * 100, 
+    y: (yPx / displayH) * 100 
+  };
+}
+</script>
 <div class="main-container">
-  <div class="scanner-frame" style="--zoom: {eyesLocked ? 1.3 : 1}">
+  <div class="scanner-frame" style="--zoom: {eyesLocked ? 1.2 : 1}">
+    
     <video bind:this={videoElement} autoplay playsinline muted></video>
     
     <div class="dynamic-geometry">
@@ -192,13 +238,12 @@
         
         {#if eyesLocked && authorizedUser}
             <div class="floating-tag" style:left="{faceBox.x}%" style:top="{faceBox.y}%">
-                <div class="tag-connector"></div>
                 <div class="tag-body">
                     <img src={authorizedUser.photo} alt="bio-capture" />
                     <div class="tag-details">
                         <div class="tag-label">MATCH CONFIRMED</div>
                         <div class="tag-name">{authorizedUser.name}</div>
-                        <div class="tag-hash">{authorizedUser.hash}</div>
+                        <div class="tag-hash">{authorizedUser.hash.substring(0, 15)}...</div>
                     </div>
                 </div>
             </div>
@@ -208,7 +253,7 @@
     <svg class="biometric-mesh" viewBox="0 0 100 100" preserveAspectRatio="none">
         {#if eyesLocked && !authorizedUser}
             {#each points as p}
-                <circle cx="{p.x}" cy="{p.y}" r="0.12" fill="#00ffff" />
+                <circle cx="{p.x}" cy="{p.y}" r="0.15" fill="#00ffff" opacity="0.5" />
             {/each}
         {/if}
     </svg>
@@ -222,11 +267,11 @@
         <div class="blink-progress">
             <div class="progress-segment" class:fill={blinkCount >= 1}></div>
             <div class="progress-segment" class:fill={blinkCount >= 2}></div>
-            <span class="progress-label">LIVENESS TEST</span>
+            <span class="progress-label">LIVENESS TEST (BLINK)</span>
         </div>
       {:else}
         <button class="action-btn" onclick={() => { authorizedUser = null; blinkCount = 0; }}>
-            RE-SCAN TARGET
+            RESET SCANNER
         </button>
       {/if}
     </div>
@@ -237,83 +282,103 @@
   :global(body) { background: #020202; margin: 0; font-family: 'Share Tech Mono', monospace; overflow: hidden; }
   
   .main-container { width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; }
-  
+
   .scanner-frame { 
-    position: relative; width: 850px; height: 500px; 
-    border: 1px solid #111; overflow: hidden; background: #000;
-    box-shadow: 0 0 40px rgba(0, 255, 255, 0.05);
+    position: relative; 
+    width: 850px; 
+    /* Forzamos que el contenedor tenga la misma proporción que la cámara */
+    aspect-ratio: 16 / 9; 
+    border: 1px solid rgba(0, 255, 255, 0.2); 
+    overflow: hidden; 
+    background: #000; 
   }
-  
+
   video { 
-    width: 100%; height: 100%; object-fit: cover; 
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%; 
+    height: 100%; 
+    /* Cambiamos cover por fill para que coincida con el sistema de puntos 0-100% */
+    object-fit: fill; 
     transform: scaleX(-1) scale(var(--zoom)); 
     transition: transform 1.5s cubic-bezier(0.19, 1, 0.22, 1); 
-    filter: brightness(0.6) contrast(1.3) grayscale(0.2) sepia(0.2); 
+    filter: brightness(0.6) contrast(1.2); 
   }
 
-  .dynamic-geometry { 
-    position: absolute; inset: 0; pointer-events: none; z-index: 10; 
-    transform: scaleX(-1) scale(var(--zoom)); transition: 1.5s; 
+  /* Todas las capas de overlay comparten el mismo tamaño y transformación que el video */
+  .dynamic-geometry, .biometric-mesh { 
+    position: absolute; 
+    inset: 0; 
+    width: 100%;
+    height: 100%;
+    pointer-events: none; 
+    z-index: 10; 
+    /* IMPORTANTE: Mismo espejo y zoom que el video */
+    transform: scaleX(-1) scale(var(--zoom)); 
+    transition: transform 1.5s cubic-bezier(0.19, 1, 0.22, 1); 
   }
 
-  /* ETIQUETA FLOTANTE (ESTILO CIBERPUNK) */
+  /* El tag debe invertir el espejo del padre para que el texto sea legible */
   .floating-tag { 
-    position: absolute; transform: translate(-105%, -40%) scaleX(-1); 
-    z-index: 50; animation: tagAppear 0.4s ease-out; 
+    position: absolute; 
+    transform: translate(-105%, -40%) scaleX(-1); 
+    z-index: 50; 
   }
-  
+
   .tag-body { 
-    background: rgba(0, 15, 15, 0.85); border-left: 3px solid #0ff; 
-    padding: 10px; display: flex; gap: 12px; backdrop-filter: blur(8px);
-    box-shadow: 10px 10px 20px rgba(0,0,0,0.5);
+    background: rgba(0, 15, 15, 0.85); 
+    border-left: 3px solid #0ff; 
+    padding: 10px; 
+    display: flex; 
+    gap: 12px; 
+    backdrop-filter: blur(8px); 
+    min-width: 200px;
   }
 
   .tag-body img { width: 60px; height: 60px; border: 1px solid rgba(0,255,255,0.3); object-fit: cover; }
-  
-  .tag-details { display: flex; flex-direction: column; justify-content: center; }
-  
-  .tag-label { font-size: 8px; color: #0ff; opacity: 0.6; letter-spacing: 1px; }
-  .tag-name { font-size: 16px; color: #0ff; text-shadow: 0 0 5px #0ff; }
-  .tag-hash { font-size: 10px; color: #aaa; margin-top: 2px; }
-
-  .tag-connector { 
-    position: absolute; right: -30px; top: 50%; width: 30px; height: 1px; 
-    background: linear-gradient(to right, #0ff, transparent); 
-  }
+  .tag-details { color: #0ff; }
+  .tag-name { font-size: 14px; font-weight: bold; }
+  .tag-label { font-size: 10px; opacity: 0.7; }
+  .tag-hash { font-size: 8px; margin-top: 4px; opacity: 0.5; }
 
   .tracker { 
-    position: absolute; width: 30px; height: 30px; 
-    border: 1px solid rgba(0, 255, 255, 0.2); transform: translate(-50%, -50%); 
+    position: absolute; 
+    width: 20px; 
+    height: 20px; 
+    border: 1px solid rgba(0, 255, 255, 0.3); 
+    transform: translate(-50%, -50%); 
+    border-radius: 50%; 
   }
-  .tracker.locked { border-color: #0ff; border-width: 2px; box-shadow: 0 0 15px #0ff; }
+  
+  .tracker.locked { border-color: #0ff; box-shadow: 0 0 10px #0ff; }
 
-  .biometric-mesh { 
-    position: absolute; inset: 0; z-index: 5; pointer-events: none; 
-    transform: scaleX(-1) scale(var(--zoom)); transition: 1.5s; 
-  }
+  .biometric-mesh { z-index: 5; }
 
   .hud { 
-    position: absolute; bottom: 0; width: 100%; 
-    padding: 30px; display: flex; flex-direction: column; align-items: center;
-    background: linear-gradient(transparent, rgba(0,0,0,0.8));
-    z-index: 100;
+    position: absolute; 
+    bottom: 20px; 
+    width: 100%; 
+    display: flex; 
+    flex-direction: column; 
+    align-items: center; 
+    z-index: 100; 
   }
 
-  .status-box { margin-bottom: 15px; color: #0ff; letter-spacing: 5px; font-size: 14px; }
-  .status-box.authorized { color: #0f0; text-shadow: 0 0 10px #0f0; }
-
-  .blink-progress { display: flex; align-items: center; gap: 10px; }
-  .progress-segment { width: 40px; height: 4px; background: rgba(0,255,255,0.1); border: 1px solid #0ff; }
+  .status-box { color: #0ff; letter-spacing: 3px; font-size: 12px; margin-bottom: 10px; text-transform: uppercase; }
+  .blink-progress { display: flex; gap: 8px; align-items: center; }
+  .progress-segment { width: 30px; height: 4px; border: 1px solid rgba(0,255,255,0.3); }
   .progress-segment.fill { background: #0ff; box-shadow: 0 0 10px #0ff; }
-  .progress-label { font-size: 9px; color: #0ff; margin-left: 10px; }
+  .progress-label { color: #0ff; font-size: 9px; margin-left: 10px; }
 
   .action-btn { 
-    background: #0ff; color: #000; border: none; padding: 8px 25px; 
-    font-family: inherit; font-size: 11px; cursor: pointer; font-weight: bold;
-  }
-
-  @keyframes tagAppear {
-    from { opacity: 0; transform: translate(-105%, -20%) scaleX(-1); }
-    to { opacity: 1; transform: translate(-105%, -40%) scaleX(-1); }
+    background: #0ff; 
+    color: #000; 
+    border: none; 
+    padding: 8px 20px; 
+    cursor: pointer; 
+    font-family: inherit; 
+    font-weight: bold;
+    text-transform: uppercase;
   }
 </style>

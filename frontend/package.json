@@ -12,7 +12,7 @@
         "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch"
     },
     "dependencies": {
-        "@vladmandic/face-api": "^1.7.12"
+        "@mediapipe/tasks-vision": "^0.10.20"
     },
     "devDependencies": {
         "@sveltejs/adapter-auto": "^7.0.0",
