@@ -1,0 +1,1 @@
+Couldn't find the requested file /wasm/vision_wasm_solution_packed_assets_loader.js in @mediapipe/tasks-vision.

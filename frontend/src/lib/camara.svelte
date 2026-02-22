@@ -136,7 +136,11 @@
   }
 
   function processFaceData(landmarks: any[], blendShapes: any[]) {
-    points = landmarks.map(p => ({ x: p.x * 100, y: p.y * 100 }));
+    points = landmarks.map(p => ({ 
+      x: p.x * 100, 
+      y: p.y * 100, 
+      z: p.z // La profundidad suele ser un valor pequeño (ej. -0.1 a 0.1)
+    }));
 
     if (!authorizedUser) {
         const xs = landmarks.map(p => p.x);
@@ -264,9 +268,13 @@
     <svg class="biometric-mesh" viewBox="0 0 100 100" preserveAspectRatio="none">
         {#if eyesLocked && !authorizedUser}
             {#each points as p}
-                <circle cx="{p.x}" cy="{p.y}" r="0.18" 
-                        fill={isProcessing ? "#ff00ff" : "#00ffff"} 
-                        opacity={isProcessing ? "0.8" : "0.4"} />
+                <circle 
+                      cx="{p.x}" 
+                      cy="{p.y}" 
+                      r={0.18 - (p.z * 0.5)} 
+                      fill={isProcessing ? "#ff00ff" : "#00ffff"} 
+                      opacity={isProcessing ? 0.8 : (0.4 - p.z)} 
+                />
             {/each}
         {/if}
     </svg>
