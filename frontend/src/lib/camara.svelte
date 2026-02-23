@@ -1,574 +1,330 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
+  import { browser } from '$app/environment';
 
-  // --- ESTADOS DE SISTEMA (Mantenidos) ---
+  // --- ESTADOS OPTIMIZADOS (Svelte 5) ---
   let videoElement = $state<HTMLVideoElement | null>(null);
-  let status = $state("SISTEMA LISTO");
-  let points = $state<{x: number, y: number, z: number}[]>([]); 
-  let eyesLocked = $state(false);
-  let blinkCount = $state(0);
+  let status = $state("SYSTEM_BOOTING...");
   let authorizedUser = $state<any>(null);
-  let faceBox = $state({ x: 0, y: 0, w: 0, h: 0 }); 
-  let isBlinking = $state(false); 
-  let leftCircle = $state({ x: 0, y: 0, active: false });
-  let rightCircle = $state({ x: 0, y: 0, active: false });
+  let isProcessing = false; // No reactivo para evitar overhead en el bucle principal
+  let blinkCount = $state(0);
+  let isBlinking = false;
+  
+  let precision = $state("0.0000000");
+  let facePos = $state({ x: 0, y: 0, w: 0, h: 0 });
+  let userThumb = $state<string | null>(null);
 
-  // --- LÓGICA DE REGISTRO MULTI-POSE (Mejorada) ---
+  // --- TERMINAL DE LOGS ---
+  let logs = $state<{msg: string, time: string, type: 'info' | 'warn' | 'success'}[]>([]);
+
+  function addLog(msg: string, type: 'info' | 'warn' | 'success' = 'info') {
+    const time = new Date().toLocaleTimeString('en-GB', { hour12: false });
+    logs = [{ msg, time, type }, ...logs].slice(0, 8);
+  }
+
+  // --- MOTOR WASM Y RENDIMIENTO ---
+  let engine: any;
+  let wasmModule: any;
+  let sharedBufferPtr: number;
+  const DIMS = 478 * 3;
+  let videoWidth = 0;
+  let videoHeight = 0;
+
+  // Recursos de captura (Reutilizados para evitar GC)
+  let canvasThumb: HTMLCanvasElement;
+  let ctxThumb: CanvasRenderingContext2D | null;
+
+  // --- REGISTRO ---
   let isRegistering = $state(false);
-  let regProgress = $state(0);
-  let galleryVectors = $state<Record<string, number[]>>({}); // Galería de promedios
-  let poseBuffer: Float32Array[] = []; 
-  const POSE_SAMPLES = 5; // Frames por ángulo
+  let rawPoseSamples: Float32Array[] = [];
+  let anglesDone = $state({ left: false, right: false, up: false, down: false });
 
-  let anglesDone = $state({ left: false, right: false, up: false, down: false, center: false });
-  let isStabilized = $state(false);
-  let stabilityStartTime = $state<number | null>(null);
+  async function loadWasmEngine() {
+    const scriptPath = '/camara.js';
+    const wasmGlue = await import(/* @vite-ignore */ scriptPath);
+    return await wasmGlue.default({ locateFile: (path: string) => `/${path}` });
+  }
 
-  // --- LÓGICA DE LOGIN (Matemáticas Optimizadas) ---
-  let isProcessing = $state(false);
-  let frameBuffer: Float32Array[] = []; 
-  const SAMPLES_REQUIRED = 2; 
-  const MATCH_THRESHOLD = 0.99; // Umbral realista para entornos variables
-  const NEW_USER_THRESHOLD = 0.80;
-  const DB_KEY = "BIOMETRIC_LOCAL_DB_V2";
+  onMount(async () => {
+    if (!browser) return;
 
-  let faceLandmarker: any;
-  let rawLandmarks: any[] = []; 
-  const mediapipePath = '/mediapipe';
+    // Inicialización de recursos de captura optimizada
+    canvasThumb = document.createElement('canvas');
+    canvasThumb.width = 100; canvasThumb.height = 100;
+    ctxThumb = canvasThumb.getContext('2d', { alpha: false, desynchronized: true });
 
-  // --- DERIVADOS (UI) ---
-  let nextGoal = $derived(() => {
-    if (!isRegistering) return null;
-    if (!anglesDone.left) return { icon: '←' };
-    if (!anglesDone.right) return { icon: '→' };
-    if (!anglesDone.up) return { icon: '↑' };
-    if (!anglesDone.down) return { icon: '↓' };
-    if (!isStabilized) return { icon: '⌛' };
-    if (!anglesDone.center) return { icon: '👁️' };
-    return null;
+    try {
+      status = "LOADING_WASM_CORE...";
+      wasmModule = await loadWasmEngine();
+      engine = new wasmModule.BiometricEngine();
+      sharedBufferPtr = wasmModule._malloc(DIMS * 4);
+
+      const mp = await import("@mediapipe/tasks-vision");
+      const files = await mp.FilesetResolver.forVisionTasks('/mediapipe');
+      const faceLandmarker = await mp.FaceLandmarker.createFromOptions(files, {
+        baseOptions: { modelAssetPath: `/mediapipe/face_landmarker.task`, delegate: "GPU" },
+        outputFaceBlendshapes: true,
+        runningMode: "VIDEO",
+        numFaces: 1
+      });
+
+      status = "PROTOCOL_ALPHA_ACTIVE";
+      addLog("ENGINE_LOADED", "info");
+      startCamera(faceLandmarker);
+    } catch (e) {
+      status = "CORE_FAILURE";
+      addLog("CRITICAL_WASM_ERROR", "warn");
+    }
   });
 
-  onMount(() => {
-    const initializeAI = async () => {
-      try {
-        status = "CARGANDO IA...";
-        const mpTasks = await import("@mediapipe/tasks-vision");
-        const { FaceLandmarker, FilesetResolver } = mpTasks;
-        const filesetResolver = await FilesetResolver.forVisionTasks(mediapipePath);
-
-        faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
-          baseOptions: { modelAssetPath: `${mediapipePath}/face_landmarker.task`, delegate: "GPU" },
-          outputFaceBlendshapes: true,
-          runningMode: "VIDEO",
-          numFaces: 1
-        });
-
-        status = "SISTEMA ONLINE";
-        setupCamera();
-      } catch (e) { status = "ERROR DE SISTEMA"; }
-    };
-    initializeAI();
-  });
-
-  // --- MATEMÁTICAS AVANZADAS ---
-function getFeatureVector(landmarks: any[]) {
-    const anchor = landmarks[1]; // Nariz (punto estable)
-    
-    // Calculamos una escala basada en el volumen del rostro, no solo una línea
-    const top = landmarks[10], bottom = landmarks[152];
-    const left = landmarks[234], right = landmarks[454];
-    
-    const height = Math.sqrt(Math.pow(top.x - bottom.x, 2) + Math.pow(top.y - bottom.y, 2));
-    const width = Math.sqrt(Math.pow(left.x - right.x, 2) + Math.pow(left.y - right.y, 2));
-    const scale = (height + width) / 2 || 1;
-
-    const vector = new Float32Array(landmarks.length * 3);
-    for (let i = 0; i < landmarks.length; i++) {
-        // Normalizamos coordenadas y aplicamos un factor de suavizado al eje Z
-        vector[i * 3] = (landmarks[i].x - anchor.x) / scale;
-        vector[i * 3 + 1] = (landmarks[i].y - anchor.y) / scale;
-        vector[i * 3 + 2] = (landmarks[i].z - anchor.z) / (scale * 0.5); // Reducimos ruido Z
+  async function startCamera(faceLandmarker: any) {
+    const stream = await navigator.mediaDevices.getUserMedia({ 
+      video: { width: 1280, height: 720, frameRate: { ideal: 30 } } 
+    });
+    if (videoElement) {
+      videoElement.srcObject = stream;
+      videoElement.onloadedmetadata = () => {
+        videoWidth = videoElement!.clientWidth;
+        videoHeight = videoElement!.clientHeight;
+        videoElement?.play();
+        predict(faceLandmarker);
+      };
     }
-    return vector;
-  }
-  function getFaceOrientation(landmarks: any[]) {
-    const left = landmarks[234], right = landmarks[454], top = landmarks[10], bottom = landmarks[152];
-    return { yaw: right.z - left.z, pitch: top.z - bottom.z };
   }
 
-function calculateCosineSimilarity(vecA: Float32Array, vecB: Float32Array) {
-    let dotProduct = 0, normA = 0, normB = 0;
-    for (let i = 0; i < vecA.length; i++) {
-        dotProduct += vecA[i] * vecB[i];
-        normA += vecA[i] * vecA[i];
-        normB += vecB[i] * vecB[i];
+  function captureThumb(): string {
+    if (ctxThumb && videoElement) {
+      ctxThumb.drawImage(videoElement, 490, 210, 300, 300, 0, 0, 100, 100);
+      return canvasThumb.toDataURL('image/webp', 0.7);
     }
-    const similarity = dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
-    
-    // Si la similitud es negativa o extremadamente baja, retornamos 0
-    return Math.max(0, similarity);
+    return "";
   }
 
-  function averageVectors(vectors: Float32Array[]): number[] {
-    const size = vectors[0].length;
-    const avg = new Float32Array(size);
-    for (let i = 0; i < size; i++) {
-      let sum = 0;
-      for (let v of vectors) sum += v[i];
-      avg[i] = sum / vectors.length;
-    }
-    return Array.from(avg);
-  }
-
-  // --- LÓGICA DE NEGOCIO ---
-async function handleBiometricCheck() {
-    if (isProcessing) return;
+  function predict(faceLandmarker: any) {
+    if (!videoElement || !wasmModule || !sharedBufferPtr) return;
     
-    const currentVector = getFeatureVector(rawLandmarks);
-    if (frameBuffer.length < SAMPLES_REQUIRED) frameBuffer.push(currentVector);
+    const results = faceLandmarker.detectForVideo(videoElement, performance.now());
     
-    status = `PROCESANDO IDENTIDAD...`;
+    if (results.faceLandmarks?.[0]) {
+      const lms = results.faceLandmarks[0];
+      
+      // OPTIMIZACIÓN: Single-pass para Bounding Box y HEAP copy (Evita .map y .Math.min)
+      let minX = 1, minY = 1, maxX = 0, maxY = 0;
+      const heap = new Float32Array(wasmModule.HEAPF32.buffer, sharedBufferPtr, DIMS);
 
-    if (frameBuffer.length >= SAMPLES_REQUIRED) {
-        isProcessing = true;
-        try {
-            const consensusCurrent = new Float32Array(averageVectors(frameBuffer));
-            const db = JSON.parse(localStorage.getItem(DB_KEY) || "[]");
-            let bestMatch = null, highestScore = 0;
+      for (let i = 0; i < 478; i++) {
+        const pt = lms[i];
+        if (pt.x < minX) minX = pt.x; if (pt.x > maxX) maxX = pt.x;
+        if (pt.y < minY) minY = pt.y; if (pt.y > maxY) maxY = pt.y;
+        
+        const offset = i * 3;
+        heap[offset] = pt.x; 
+        heap[offset + 1] = pt.y; 
+        heap[offset + 2] = pt.z;
+      }
+      
+      facePos = {
+        x: (1 - minX) * videoWidth - ((maxX - minX) * videoWidth),
+        y: minY * videoHeight,
+        w: (maxX - minX) * videoWidth,
+        h: (maxY - minY) * videoHeight
+      };
 
-            const { yaw, pitch } = getFaceOrientation(rawLandmarks);
-            const isFrontal = Math.abs(yaw) < 0.1 && Math.abs(pitch) < 0.1;
-
-            for (const user of db) {
-                const scoreCenter = calculateCosineSimilarity(consensusCurrent, new Float32Array(user.gallery.center));
-                let finalScore = 0;
-
-                if (isFrontal) {
-                    finalScore = scoreCenter;
-                } else {
-                    let bestAngleScore = 0;
-                    for (const angleKey in user.gallery) {
-                        if (angleKey === 'center') continue;
-                        const s = calculateCosineSimilarity(consensusCurrent, new Float32Array(user.gallery[angleKey]));
-                        if (s > bestAngleScore) bestAngleScore = s;
-                    }
-                    finalScore = (scoreCenter * 0.4) + (bestAngleScore * 0.6);
-                }
-
-                if (finalScore > highestScore) {
-                  highestScore = finalScore;
-                  bestMatch = user;
-                }
+      const analysis = engine.processFrame(sharedBufferPtr, 478);
+      
+      // Liveness optimizado
+      const shapes = results.faceBlendshapes[0]?.categories;
+      if (shapes) {
+        let blinkScore = 0;
+        for (let i = 0; i < shapes.length; i++) {
+            if (shapes[i].categoryName === 'eyeBlinkLeft' || shapes[i].categoryName === 'eyeBlinkRight') {
+                blinkScore += shapes[i].score;
             }
-
-            // --- LÓGICA DE DECISIÓN CON PRECISIÓN DE 5 DECIMALES ---
-            if (highestScore >= MATCH_THRESHOLD) {
-                authorizedUser = bestMatch;
-                // Mostramos el nombre y el score con precisión extrema (ej: 0.85231)
-                status = `ACCESO: ${bestMatch.name} (${highestScore.toFixed(5)})`;
-            } else if (highestScore < NEW_USER_THRESHOLD) {
-                status = "USUARIO NO RECONOCIDO";
-                startPoseRegistration();
-            } else {
-                // Si falla, también mostramos la precisión para saber qué tan cerca estuvimos
-                status = `REINTENTE - SCORE: ${highestScore.toFixed(5)}`;
-            }
-
-            frameBuffer = [];
-            blinkCount = 0;
-            
-        } catch (error) {
-            status = "ERROR DE CÁLCULO";
-            console.error(error);
-        } finally { 
-            isProcessing = false; 
         }
+        const eyeBlink = (blinkScore / 2) > 0.45;
+        
+        if (eyeBlink && !isBlinking) {
+          isBlinking = true; blinkCount++;
+          addLog(`LIVENESS_BEEP_${blinkCount}`, "info");
+          if (blinkCount >= 2) {
+            if (isRegistering) finalizeRegistration();
+            else if (!authorizedUser) checkBiometrics();
+          }
+        } else if (!eyeBlink) isBlinking = false;
+      }
+
+      if (isRegistering) handlePoseCapture(analysis.yaw, analysis.pitch, heap);
     }
+    requestAnimationFrame(() => predict(faceLandmarker));
   }
 
-  function handleRegistrationPose(landmarks: any[]) {
-    const { yaw, pitch } = getFaceOrientation(landmarks);
-    const vec = getFeatureVector(landmarks);
-
-    const captureAngle = (key: string) => {
-      poseBuffer.push(vec);
-      status = `CAPTURANDO ${key.toUpperCase()}: ${poseBuffer.length}/${POSE_SAMPLES}`;
-      if (poseBuffer.length >= POSE_SAMPLES) {
-        galleryVectors[key] = averageVectors(poseBuffer);
-        poseBuffer = [];
-        // @ts-ignore
+  function handlePoseCapture(yaw: number, pitch: number, heap: Float32Array) {
+    const cap = (key: keyof typeof anglesDone) => {
+      rawPoseSamples.push(new Float32Array(heap));
+      if (rawPoseSamples.length % 60 === 0) {
         anglesDone[key] = true;
+        addLog(`VECTOR_${key.toUpperCase()}_CAPTURED`, "success");
       }
     };
+    if (!anglesDone.left && yaw < -0.05) cap('left');
+    else if (!anglesDone.right && yaw > 0.05) cap('right');
+    else if (!anglesDone.up && pitch > 0.05) cap('up');
+    else if (!anglesDone.down && pitch < -0.05) cap('down');
+  }
 
-    // Captura secuencial de extremos
-    if (!anglesDone.left && yaw < -0.16) captureAngle('left');
-    else if (!anglesDone.right && yaw > 0.16) captureAngle('right');
-    else if (!anglesDone.up && pitch > 0.13) captureAngle('up');
-    else if (!anglesDone.down && pitch < -0.13) captureAngle('down');
-
-    const sidesDone = [anglesDone.left, anglesDone.right, anglesDone.up, anglesDone.down].filter(v => v).length;
+  async function checkBiometrics() {
+    if (isProcessing) return;
+    isProcessing = true;
+    status = "QUANTUM_MATCHING...";
     
-    // Lógica de estabilización previa al parpadeo
-    if (sidesDone === 4) {
-      const isCentered = Math.abs(yaw) < 0.05 && Math.abs(pitch) < 0.05;
-      if (isCentered) {
-        if (!stabilityStartTime) stabilityStartTime = Date.now();
-        if (Date.now() - stabilityStartTime >= 1000) {
-          isStabilized = true;
-          status = "ESTABLE. PARPADEA 2 VECES";
-        } else {
-          status = "ESTABILIZANDO ROSTRO...";
-        }
-      } else {
-        stabilityStartTime = null;
-        isStabilized = false;
-        status = "MIRA AL CENTRO";
-      }
+    const db = JSON.parse(localStorage.getItem("BIO_DB_V5") || "[]");
+    let match = null;
+    let minDistance = 999;
+
+    for (const user of db) {
+      const mPtr = wasmModule._malloc(DIMS * 4);
+      const iPtr = wasmModule._malloc(DIMS * 4);
+      wasmModule.HEAPF32.set(new Float32Array(user.model.mean), mPtr / 4);
+      wasmModule.HEAPF32.set(new Float32Array(user.model.invCovariance), iPtr / 4);
+
+      const dist = engine.calculateMahalanobis(sharedBufferPtr, mPtr, iPtr, DIMS);
+      if (dist < minDistance) { minDistance = dist; match = user; }
+      wasmModule._free(mPtr); wasmModule._free(iPtr);
     }
-    regProgress = (sidesDone / 5) * 100;
+
+    const rawScore = engine.getConfidenceScore(minDistance);
+    precision = rawScore.toFixed(7);
+
+    if (match && rawScore >= 99.85) {
+      authorizedUser = match;
+      userThumb = match.thumb;
+      status = "ACCESS_GRANTED_ALPHA";
+      addLog(`AUTH_SUCCESS: ${precision}%`, "success");
+    } else {
+      authorizedUser = null;
+      status = rawScore > 99.0 ? "MARGINAL_CONFIDENCE_REJECT" : "SECURITY_BREACH_DETECTED";
+      addLog(`REJECTED: ${precision}%`, "warn");
+    }
+    isProcessing = false;
   }
 
   async function finalizeRegistration() {
-    // El centro también se promedia para mayor calidad
-    const centerAvg = averageVectors([getFeatureVector(rawLandmarks)]);
-    galleryVectors['center'] = centerAvg;
-    anglesDone.center = true;
-    regProgress = 100;
+    status = "ENCRYPTING_VAULT...";
+    const tPtr = wasmModule._malloc(rawPoseSamples.length * DIMS * 4);
+    const tHeap = new Float32Array(wasmModule.HEAPF32.buffer, tPtr, rawPoseSamples.length * DIMS);
+    rawPoseSamples.forEach((v, i) => tHeap.set(v, i * DIMS));
 
-    const photo = await captureThumb();
-    const newUser = { 
-      id: crypto.randomUUID(), 
-      name: `USER_${Math.random().toString(36).substr(2, 4).toUpperCase()}`, 
-      gallery: { ...galleryVectors }, // Guardamos el set completo de poses
-      photo: photo
-    };
-    
-    const db = JSON.parse(localStorage.getItem(DB_KEY) || "[]");
-    db.push(newUser);
-    localStorage.setItem(DB_KEY, JSON.stringify(db));
-    authorizedUser = newUser;
-    isRegistering = false;
-    status = "REGISTRO COMPLETADO";
+    const model = engine.trainModel(tPtr, rawPoseSamples.length, DIMS, crypto.randomUUID());
+    const db = JSON.parse(localStorage.getItem("BIO_DB_V5") || "[]");
+    db.push({ id: model.userId, thumb: captureThumb(), model: { mean: Array.from(model.mean), invCovariance: Array.from(model.invCovariance) } });
+    localStorage.setItem("BIO_DB_V5", JSON.stringify(db));
+    wasmModule._free(tPtr);
+    rawPoseSamples = []; isRegistering = false; 
+    status = "VAULT_SEALED";
+    addLog("PROFILE_SAVED", "success");
   }
 
-  // --- RESTO DE FUNCIONES (Siguen igual para no romper UI) ---
-  async function setupCamera() {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 } });
-    if (videoElement) { 
-        videoElement.srcObject = stream; 
-        videoElement.onloadedmetadata = () => { 
-          videoElement?.play(); 
-          requestAnimationFrame(predict); 
-        }; 
-    }
-  }
-
-  async function predict() {
-    if (!videoElement || !faceLandmarker) return;
-    const results = faceLandmarker.detectForVideo(videoElement, performance.now());
-
-    if (results.faceLandmarks?.length > 0) {
-      rawLandmarks = results.faceLandmarks[0];
-      
-      // --- UI Y TRACKING ---
-      points = rawLandmarks.map(p => ({ x: p.x * 100, y: p.y * 100, z: p.z }));
-      leftCircle = { x: rawLandmarks[468].x * 100, y: rawLandmarks[468].y * 100, active: true };
-      rightCircle = { x: rawLandmarks[473].x * 100, y: rawLandmarks[473].y * 100, active: true };
-      
-      const xs = points.map(p => p.x);
-      const ys = points.map(p => p.y);
-      faceBox = { x: Math.min(...xs), y: Math.min(...ys), w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) };
-      eyesLocked = true;
-
-      // --- DETECCIÓN DE BLENDSHAPES ---
-      const blend = results.faceBlendshapes[0]?.categories || [];
-      const blinkL = blend.find(s => s.categoryName === "eyeBlinkLeft")?.score || 0;
-      const blinkR = blend.find(s => s.categoryName === "eyeBlinkRight")?.score || 0;
-      
-      // Lógica de parpadeo sincronizada
-      if (blinkL > 0.5 && blinkR > 0.5) {
-          // CAPTURA INMEDIATA: Llenamos el buffer mientras el ojo está cerrado
-          if (!isProcessing && !authorizedUser && !isRegistering) {
-              const currentVector = getFeatureVector(rawLandmarks);
-              if (frameBuffer.length < SAMPLES_REQUIRED) {
-                  frameBuffer.push(currentVector);
-              }
-          }
-
-          if (!isBlinking) { 
-            isBlinking = true; 
-            blinkCount++; 
-            
-            // Verificamos si ya llegamos a los 2 parpadeos
-            if (blinkCount >= 2) {
-                if (isRegistering && isStabilized) {
-                    finalizeRegistration();
-                } else if (!isRegistering && !authorizedUser) {
-                    // Si por velocidad el buffer no se llenó, forzamos la última muestra
-                    if (frameBuffer.length < SAMPLES_REQUIRED) {
-                      frameBuffer.push(getFeatureVector(rawLandmarks));
-                    }
-                    handleBiometricCheck();
-                }
-            }
-          }
-      } else { 
-          isBlinking = false; 
-      }
-
-      if (isRegistering && !anglesDone.center) handleRegistrationPose(rawLandmarks);
-
-    } else { 
-        eyesLocked = false; 
-        leftCircle.active = false; 
-        rightCircle.active = false; 
-        if (!isProcessing) frameBuffer = []; 
-        blinkCount = 0;
-        stabilityStartTime = null;
-    }
-    requestAnimationFrame(predict);
-  }
-
-  async function captureThumb(): Promise<string> {
-    const canvas = document.createElement('canvas');
-    canvas.width = 160; canvas.height = 160;
-    const ctx = canvas.getContext('2d');
-    if (videoElement && ctx) ctx.drawImage(videoElement, videoElement.videoWidth/2 - 360, 0, 720, 720, 0, 0, 160, 160);
-    return canvas.toDataURL('image/jpeg', 0.8);
-  }
-
-  function startPoseRegistration() {
-    isRegistering = true;
-    galleryVectors = {};
-    poseBuffer = [];
-    regProgress = 0;
-    blinkCount = 0;
-    isStabilized = false;
-    stabilityStartTime = null;
-    anglesDone = { left: false, right: false, up: false, down: false, center: false };
-    status = "INICIANDO CALIBRACIÓN";
-  }
+  onDestroy(() => { if (wasmModule && sharedBufferPtr) wasmModule._free(sharedBufferPtr); });
 </script>
 
-<div class="main-container">
-  <div class="scanner-frame" style="--zoom: {eyesLocked ? 1.2 : 1}">
-    
-    <video bind:this={videoElement} autoplay playsinline muted></video>
-    
-    <div class="dynamic-geometry">
-        <div class="tracker" class:active={leftCircle.active} class:locked={eyesLocked}
-             style:left="{leftCircle.x}%" style:top="{leftCircle.y}%"></div>
-        <div class="tracker" class:active={rightCircle.active} class:locked={eyesLocked}
-             style:left="{rightCircle.x}%" style:top="{rightCircle.y}%"></div>
-        
-        {#if eyesLocked && authorizedUser}
-            <div class="floating-tag" style:left="{faceBox.x}%" style:top="{faceBox.y}%">
-                <div class="tag-body">
-                    <img src={authorizedUser.photo} alt="bio-capture" />
-                    <div class="tag-details">
-                        <div class="tag-label">USUARIO AUTORIZADO</div>
-                        <div class="tag-name">{authorizedUser.name}</div>
-                        <div class="tag-hash">ID: {authorizedUser.id?.substring(0, 8)}</div>
-                    </div>
-                </div>
-            </div>
-        {/if}
+<main class="scanner" role="main">
+  <video bind:this={videoElement} aria-label="Escáner biométrico" muted playsinline></video>
+
+  {#if authorizedUser}
+    <div class="face-tag" style="left: {facePos.x}px; top: {facePos.y - 130}px; width: {facePos.w}px;">
+      <div class="tag-content">
+        <div class="thumb-container">
+           <img src={userThumb} alt="Thumbnail de usuario autorizado" />
+           <div class="scan-line"></div>
+        </div>
+        <div class="tag-data">
+          <span class="user-id">ID: ALPHA_{authorizedUser.id.slice(0,4)}</span>
+          <span class="conf" class:high-safety={parseFloat(precision) >= 99.85}>
+            {precision}% MATCH
+          </span>
+          <div class="accuracy-bar-container" role="progressbar" aria-valuenow={precision} aria-valuemin="0" aria-valuemax="100">
+            <div 
+              class="accuracy-fill" 
+              style="width: {precision}%; background: {parseFloat(precision) >= 99.85 ? '#0ff' : '#f00'};"
+            ></div>
+          </div>
+        </div>
+      </div>
+      <div class="tag-line"></div>
     </div>
+  {/if}
 
-    {#if isRegistering && nextGoal()}
-      <div class="registration-guide">
-        <div class="arrow-indicator">{nextGoal().icon}</div>
-        <div class="progress-mini">
-           {#each Object.values(anglesDone) as done}
-             <div class="dot" class:done></div>
-           {/each}
+  <section class="side-terminal" aria-label="Terminal de logs del sistema">
+    <div class="terminal-header">ALPHA_LOG_STREAM</div>
+    <div class="logs-container">
+      {#each logs as log (log.time + log.msg)}
+        <div class="log-entry {log.type}">
+          <span class="log-time">[{log.time}]</span>
+          <span class="log-msg">{log.msg}</span>
         </div>
-      </div>
-    {/if}
+      {/each}
+    </div>
+  </section>
 
-    <svg class="biometric-mesh" viewBox="0 0 100 100" preserveAspectRatio="none">
-        {#if eyesLocked && !authorizedUser}
-            {#each points as p}
-                <circle 
-                      cx="{p.x}" 
-                      cy="{p.y}" 
-                      r={0.18 - (p.z * 0.5)} 
-                      fill={isProcessing ? "#ff00ff" : "#00ffff"} 
-                      opacity={isProcessing ? 0.8 : (0.4 - p.z)} 
-                />
-            {/each}
-        {/if}
-    </svg>
-
+  <nav class="ui">
+    <div class="status" class:active={isProcessing} class:denied={status.includes('REJECT') || status.includes('BREACH')}>
+      {status}
+    </div>
     <div class="hud">
-      <div class="status-box" class:authorized={authorizedUser} class:scanning={isProcessing}>
-        <span class="glitch-text">{status}</span>
-      </div>
-      
-      {#if !authorizedUser}
-        <div class="blink-progress" class:disabled={isProcessing}>
-            <div class="progress-segment" class:fill={blinkCount >= 1}></div>
-            <div class="progress-segment" class:fill={blinkCount >= 2}></div>
-            <span class="progress-label">
-                {isProcessing ? 'PROCESANDO VECTOR...' : 'TEST DE VIDA (PARPADEA)'}
-            </span>
-        </div>
-      {:else}
-        <button class="action-btn" onclick={() => { authorizedUser = null; blinkCount = 0; status = "SISTEMA ONLINE"; }}>
-            REINICIAR ESCÁNER
-        </button>
+      <div class="item">LIVENESS: {blinkCount}/2</div>
+      {#if authorizedUser}
+        <div class="item match">IDENTITY_CONFIRMED</div>
       {/if}
     </div>
-  </div>
-</div>
+    {#if !isRegistering && !authorizedUser}
+      <button onclick={() => { isRegistering = true; status = "ROTATE_HEAD_FOR_CAPTURE"; blinkCount = 0; logs = []; }}>
+        INITIALIZE_ENROLLMENT
+      </button>
+    {/if}
+  </nav>
+</main>
 
 <style>
-  :global(body) { 
-    background: #020202; 
-    margin: 0; 
-    font-family: 'Share Tech Mono', monospace; 
-    overflow: hidden; 
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap');
+
+  .scanner { position: relative; width: 100vw; height: 100vh; background: #000; overflow: hidden; }
+  video { width: 100%; height: 100%; object-fit: cover; filter: grayscale(1) brightness(0.6) contrast(1.3); transform: scaleX(-1); }
+
+  .side-terminal {
+    position: absolute; right: 25px; top: 50%; transform: translateY(-50%);
+    width: 260px; background: rgba(0, 15, 15, 0.9); border-left: 2px solid #0ff;
+    font-family: 'Share Tech Mono', monospace; padding: 12px; z-index: 20; backdrop-filter: blur(8px);
   }
-  
-  .main-container { 
-    width: 100vw; 
-    height: 100vh; 
-    display: flex; 
-    align-items: center; 
-    justify-content: center; 
-  }
+  .terminal-header { font-size: 0.65rem; color: #0ff; border-bottom: 1px solid rgba(0, 255, 255, 0.2); margin-bottom: 10px; padding-bottom: 5px; letter-spacing: 2px; }
+  .log-entry { font-size: 0.6rem; margin-bottom: 6px; display: flex; gap: 8px; animation: logSlide 0.2s ease-out; }
+  .log-time { color: #555; }
+  .info { color: #0ff; }
+  .warn { color: #f00; }
+  .success { color: #0f0; }
 
-  .scanner-frame { 
-    position: relative; 
-    width: 850px; 
-    aspect-ratio: 16 / 9; 
-    border: 1px solid rgba(0, 255, 255, 0.2); 
-    background: #000; 
-    box-shadow: 0 0 40px rgba(0,0,0,0.5);
-  }
+  .face-tag { position: absolute; pointer-events: none; transition: all 0.04s linear; display: flex; flex-direction: column; align-items: center; z-index: 10; }
+  .tag-content { background: rgba(0, 15, 20, 0.95); border: 1px solid #0ff; backdrop-filter: blur(10px); display: flex; gap: 12px; padding: 10px; box-shadow: 0 0 30px rgba(0, 255, 255, 0.3); }
+  .thumb-container { position: relative; width: 50px; height: 50px; border: 1px solid #0ff; overflow: hidden; }
+  .thumb-container img { width: 100%; height: 100%; object-fit: cover; filter: grayscale(1) cyan; }
+  .scan-line { position: absolute; width: 100%; height: 2px; background: #0ff; box-shadow: 0 0 10px #0ff; animation: scanLine 2s infinite linear; }
+  .tag-data { display: flex; flex-direction: column; font-family: 'Share Tech Mono', monospace; width: 150px; }
+  .user-id { color: #888; font-size: 10px; letter-spacing: 1px; }
+  .conf { color: #ff0; font-size: 11px; margin-top: 2px; }
+  .high-safety { color: #fff !important; text-shadow: 0 0 10px #0ff; }
+  .accuracy-bar-container { width: 100%; height: 4px; background: #111; margin-top: 6px; }
+  .accuracy-fill { height: 100%; transition: width 0.05s linear; }
+  .tag-line { width: 1px; height: 60px; background: linear-gradient(to bottom, #0ff, transparent); }
 
-  video { 
-    position: absolute;
-    inset: 0;
-    width: 100%; 
-    height: 100%; 
-    object-fit: fill; 
-    transform: scaleX(-1) scale(var(--zoom)); 
-    transition: transform 1.2s cubic-bezier(0.19, 1, 0.22, 1); 
-    filter: brightness(0.7) contrast(1.1); 
-  }
+  .ui { position: absolute; bottom: 60px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; align-items: center; gap: 20px; z-index: 5; }
+  .status { font-family: 'Share Tech Mono', monospace; font-size: 1.3rem; color: #0ff; text-shadow: 0 0 10px #0ff; letter-spacing: 3px; }
+  .status.active { animation: pulse 0.8s infinite; }
+  .status.denied { color: #f00; }
+  .hud { display: flex; gap: 20px; background: rgba(0, 10, 10, 0.8); padding: 12px 25px; border-left: 3px solid #0ff; font-family: 'Share Tech Mono', monospace; color: #0ff; font-size: 0.75rem; }
+  .match { color: #0f0; font-weight: bold; border-left: 1px solid #0f0; padding-left: 20px; }
+  button { background: rgba(0, 255, 255, 0.05); border: 1px solid #0ff; color: #0ff; padding: 14px 40px; cursor: pointer; font-family: 'Share Tech Mono', monospace; transition: 0.4s; letter-spacing: 2px; }
+  button:hover { background: #0ff; color: #000; box-shadow: 0 0 40px #0ff; }
 
-  .dynamic-geometry, .biometric-mesh { 
-    position: absolute; 
-    inset: 0; 
-    width: 100%;
-    height: 100%;
-    pointer-events: none; 
-    z-index: 10; 
-    /* Mantenemos el espejo para que los puntos coincidan con la cara del video */
-    transform: scaleX(-1) scale(var(--zoom)); 
-    transition: transform 1.2s cubic-bezier(0.19, 1, 0.22, 1); 
-  }
-
-  /* Des-espejamos el tag para que el texto sea legible */
-  .floating-tag { 
-    position: absolute; 
-    transform: translate(-105%, -40%) scaleX(-1); 
-    z-index: 50; 
-  }
-
-  .tag-body { 
-    background: rgba(0, 15, 15, 0.9); 
-    border-left: 3px solid #0ff; 
-    padding: 10px; 
-    display: flex; 
-    gap: 12px; 
-    backdrop-filter: blur(10px); 
-    border-radius: 0 4px 4px 0;
-  }
-
-  .tag-body img { width: 60px; height: 60px; border: 1px solid #0ff; object-fit: cover; }
-  .tag-details { color: #0ff; }
-  .tag-name { font-size: 14px; font-weight: bold; text-transform: uppercase; }
-  .tag-label { font-size: 9px; opacity: 0.7; letter-spacing: 1px; }
-  .tag-hash { font-size: 8px; margin-top: 4px; opacity: 0.5; }
-
-  /* GUÍA DE REGISTRO: Invertimos el scaleX para corregir el espejo del video */
- .registration-guide {
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    /* IMPORTANTE: 
-       1. translate(-50%, -50%) centra el div.
-       2. scaleX(-1) voltea horizontalmente el contenido para neutralizar el espejo del video.
-    */
-    transform: translate(-50%, -50%) scaleX(-1); 
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    z-index: 200;
-    pointer-events: none;
-  }
-
-
-
-  .arrow-indicator {
-    font-size: 70px;
-    color: #0ff;
-    text-shadow: 0 0 15px #0ff;
-    animation: pulseArrow 0.8s infinite alternate;
-  }
-
-  .goal-text {
-    color: #0ff;
-    font-size: 18px;
-    letter-spacing: 2px;
-    background: rgba(0, 0, 0, 0.8);
-    padding: 10px 20px;
-    border: 1px solid #0ff;
-    white-space: nowrap; /* Evita que el texto se rompa en dos líneas */
-    text-transform: uppercase;
-  }
-  .progress-mini { display: flex; gap: 8px; margin-top: 15px; }
-  .progress-mini .dot { width: 8px; height: 8px; border: 1px solid #0ff; border-radius: 50%; transition: all 0.3s; }
-  .progress-mini .dot.done { background: #0ff; box-shadow: 0 0 8px #0ff; transform: scale(1.2); }
-
-  .tracker { 
-    position: absolute; 
-    width: 18px; height: 18px; 
-    border: 1px solid rgba(0, 255, 255, 0.4); 
-    transform: translate(-50%, -50%); 
-    border-radius: 50%; 
-  }
-  .tracker.locked { border-color: #0ff; box-shadow: 0 0 10px #0ff; }
-
-  .hud { 
-    position: absolute; 
-    bottom: 30px; 
-    width: 100%; 
-    display: flex; 
-    flex-direction: column; 
-    align-items: center; 
-    z-index: 100; 
-  }
-
-  .status-box { color: #0ff; letter-spacing: 4px; font-size: 13px; margin-bottom: 15px; text-transform: uppercase; }
-  .blink-progress { display: flex; gap: 10px; align-items: center; }
-  .progress-segment { width: 35px; height: 5px; border: 1px solid rgba(0,255,255,0.3); transition: all 0.4s; }
-  .progress-segment.fill { background: #0ff; box-shadow: 0 0 12px #0ff; border-color: #0ff; }
-  .progress-label { color: #0ff; font-size: 10px; margin-left: 12px; opacity: 0.8; }
-
-  .action-btn { 
-    background: #0ff; color: #000; border: none; padding: 10px 25px; 
-    cursor: pointer; font-family: inherit; font-weight: bold; 
-    letter-spacing: 1px; transition: all 0.2s;
-  }
-  .action-btn:hover { background: #fff; box-shadow: 0 0 15px #fff; }
-
-  @keyframes pulseArrow {
-    from { transform: scale(1); opacity: 0.7; }
-    to { transform: scale(1.15); opacity: 1; }
-  }
+  @keyframes scanLine { 0% { top: -10%; } 100% { top: 110%; } }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+  @keyframes logSlide { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
 </style>
