@@ -5,12 +5,10 @@ services:
       dockerfile: Dockerfile
     container_name: crow-app
     ports:
-      - "${PORT_HTTP:-80}:8080"
+      - "${PORT_HTTP:-443}:443"
     volumes:
       # CAMBIO: Usamos una carpeta local './data' en el host para la base de datos
       - ./data:/database
-      # Mantenemos el montaje de estáticos si lo necesitas para desarrollo
-      - ./backend/src/frontend:/app/static 
     restart: unless-stopped
     deploy:
       resources:

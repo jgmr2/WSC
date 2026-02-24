@@ -45,7 +45,6 @@
       const res = await fetch('/api/get-biometrics');
       if (!res.ok) throw new Error();
       const data = await res.json();
-      // Mapeamos los datos asegurando que el modelo sea un objeto JSON
       return data.map((u: any) => ({
         ...u,
         model: typeof u.model === 'string' ? JSON.parse(u.model) : u.model
@@ -63,7 +62,7 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           key: `BIO_${userData.id}`,
-          value: JSON.stringify(userData)
+          value: JSON.stringify(userData) // El backend lo guardará en SQLite
         })
       });
       return res.ok;
@@ -206,7 +205,6 @@
     isProcessing = true;
     status = "QUERYING_SQLITE_VAULT...";
     
-    // CAMBIO: Obtenemos la base de datos desde el Backend
     const db = await fetchBiometricDB();
     
     if (db.length === 0) {
@@ -263,21 +261,21 @@
       } 
     };
 
-    // CAMBIO: Sincronización persistente con SQLite
+    // --- SINCRONIZACIÓN EXCLUSIVA CON SERVIDOR ---
+    addLog("TRANSMITTING_TO_CORE...", "info");
     const success = await syncProfileToServer(newUser);
 
     wasmModule._free(tPtr);
     rawPoseSamples = []; 
     isRegistering = false; 
+    anglesDone = { left: false, right: false, up: false, down: false };
 
     if (success) {
       status = "VAULT_SEALED_SQLITE";
       addLog("REMOTE_PROFILE_SAVED", "success");
     } else {
-      status = "SYNC_FAILED_LOCAL_ONLY";
-      addLog("BACKEND_OFFLINE", "warn");
-      // Fallback a localStorage por si acaso
-      localStorage.setItem("BIO_BACKUP", JSON.stringify(newUser));
+      status = "CORE_SYNC_FAILED";
+      addLog("BACKEND_UNREACHABLE", "warn");
     }
   }
 
@@ -291,7 +289,7 @@
     <div class="face-tag" style="left: {facePos.x}px; top: {facePos.y - 130}px; width: {facePos.w}px;">
       <div class="tag-content">
         <div class="thumb-container">
-           <img src={userThumb} alt="Thumbnail de usuario autorizado" />
+           <img src={userThumb} alt="Usuario" />
            <div class="scan-line"></div>
         </div>
         <div class="tag-data">
@@ -299,7 +297,7 @@
           <span class="conf" class:high-safety={parseFloat(precision) >= 99.85}>
             {precision}% MATCH
           </span>
-          <div class="accuracy-bar-container" role="progressbar" aria-valuenow={precision} aria-valuemin="0" aria-valuemax="100">
+          <div class="accuracy-bar-container">
             <div 
               class="accuracy-fill" 
               style="width: {precision}%; background: {parseFloat(precision) >= 99.85 ? '#0ff' : '#f00'};"
@@ -311,7 +309,7 @@
     </div>
   {/if}
 
-  <section class="side-terminal" aria-label="Terminal de logs del sistema">
+  <section class="side-terminal">
     <div class="terminal-header">ALPHA_LOG_STREAM</div>
     <div class="logs-container">
       {#each logs as log (log.time + log.msg)}
@@ -324,7 +322,7 @@
   </section>
 
   <nav class="ui">
-    <div class="status" class:active={isProcessing} class:denied={status.includes('REJECT') || status.includes('BREACH')}>
+    <div class="status" class:active={isProcessing} class:denied={status.includes('REJECT') || status.includes('BREACH') || status.includes('FAILED')}>
       {status}
     </div>
     <div class="hud">
