@@ -23,7 +23,7 @@ COPY ./frontend/static/mediapipe ./static/mediapipe
 RUN bun x svelte-kit sync
 RUN bun run build
 
-### ETAPA 3: COMPILACIÓN DEL BACKEND (C++ CROW & POSTGRESQL)
+### ETAPA 3: COMPILACIÓN DEL BACKEND (C++ CROW & SQLITE)
 FROM alpine:latest AS build
 RUN apk add --no-cache \
     build-base \
@@ -35,18 +35,27 @@ RUN apk add --no-cache \
     zlib-dev \
     zlib-static \
     asio-dev \
-    postgresql-dev \
+    sqlite-dev \
+    sqlite-static \
     nlohmann-json
-RUN echo "appuser:x:10001:10001:appuser:/:/sbin/nologin" > /etc/passwd_app
+
+# Preparamos el usuario y el directorio para la base de datos SQLite
+RUN echo "appuser:x:10001:10001:appuser:/:/sbin/nologin" > /etc/passwd_app && \
+    mkdir -p /app/database && \
+    chown 10001:10001 /app/database
+
 RUN git clone --depth 1 https://github.com/CrowCpp/Crow.git /tmp/crow && \
     mkdir -p /usr/local/include && \
     cp -r /tmp/crow/include/* /usr/local/include/ && \
     rm -rf /tmp/crow
+
 RUN git clone https://github.com/Thalhammer/jwt-cpp.git /tmp/jwt && \
     cp -r /tmp/jwt/include/* /usr/local/include/ && \
     rm -rf /tmp/jwt
+
 WORKDIR /app
 COPY ./backend/src ./src
+# Asegúrate de que tu Makefile use -lsqlite3 y que el path de la DB apunte a /database/app.db
 RUN cd src && make
 COPY --from=svelte-build /app/build ./src/static_assets
 
@@ -56,6 +65,11 @@ COPY --from=build /etc/passwd_app /etc/passwd
 COPY --from=build /app/build/app /bin/app
 COPY --from=build /app/src/static_assets /static_assets
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
+# Copiamos el directorio de la base de datos con los permisos correctos
+COPY --from=build --chown=10001:10001 /app/database /database
+
 USER appuser
 EXPOSE 8080
+# La base de datos debe persistirse montando un volumen en /database
 ENTRYPOINT ["/bin/app"]

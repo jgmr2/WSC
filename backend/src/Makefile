@@ -1,15 +1,16 @@
 CXX := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -I/usr/local/include
-LDFLAGS := -static -static-libgcc -static-libstdc++ -lpthread -lssl -lcrypto -lz -s
+# Añadimos -lsqlite3 y -ldl (necesario para SQLite en sistemas POSIX)
+# El orden de las librerías importa: las dependencias van después de los objetos
+LDFLAGS := -static -static-libgcc -static-libstdc++ \
+           -lsqlite3 -ldl -lpthread -lssl -lcrypto -lz -s
 
 SRC_DIR := .
 BUILD_DIR := ../build
 OBJ_DIR := $(BUILD_DIR)/obj
 
-# --- ESTA ES LA PARTE QUE FALTABA ---
 SOURCES := $(wildcard $(SRC_DIR)/*.cpp)
 OBJECTS := $(SOURCES:$(SRC_DIR)/%.cpp=$(OBJ_DIR)/%.o)
-# -------------------------------------
 
 TARGET := $(BUILD_DIR)/app
 
@@ -26,7 +27,7 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp | $(OBJ_DIR)
 
 $(TARGET): $(OBJECTS) | $(BUILD_DIR)
 	$(CXX) $(OBJECTS) -o $@ $(LDFLAGS)
-	@echo "✓ Binary compiled successfully: $(TARGET)"
+	@echo "✓ Binary compiled successfully (SQLite Static): $(TARGET)"
 
 clean:
 	rm -rf $(BUILD_DIR)

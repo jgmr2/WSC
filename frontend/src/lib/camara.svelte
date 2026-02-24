@@ -6,7 +6,7 @@
   let videoElement = $state<HTMLVideoElement | null>(null);
   let status = $state("SYSTEM_BOOTING...");
   let authorizedUser = $state<any>(null);
-  let isProcessing = false; // No reactivo para evitar overhead en el bucle principal
+  let isProcessing = false; 
   let blinkCount = $state(0);
   let isBlinking = false;
   
@@ -30,7 +30,6 @@
   let videoWidth = 0;
   let videoHeight = 0;
 
-  // Recursos de captura (Reutilizados para evitar GC)
   let canvasThumb: HTMLCanvasElement;
   let ctxThumb: CanvasRenderingContext2D | null;
 
@@ -38,6 +37,40 @@
   let isRegistering = $state(false);
   let rawPoseSamples: Float32Array[] = [];
   let anglesDone = $state({ left: false, right: false, up: false, down: false });
+
+  // --- INTEGRACIÓN BACKEND (SQLite Sync) ---
+  
+  async function fetchBiometricDB() {
+    try {
+      const res = await fetch('/api/get-biometrics');
+      if (!res.ok) throw new Error();
+      const data = await res.json();
+      // Mapeamos los datos asegurando que el modelo sea un objeto JSON
+      return data.map((u: any) => ({
+        ...u,
+        model: typeof u.model === 'string' ? JSON.parse(u.model) : u.model
+      }));
+    } catch (e) {
+      addLog("DB_FETCH_FAILED", "warn");
+      return [];
+    }
+  }
+
+  async function syncProfileToServer(userData: any) {
+    try {
+      const res = await fetch('/api/save-localstorage', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          key: `BIO_${userData.id}`,
+          value: JSON.stringify(userData)
+        })
+      });
+      return res.ok;
+    } catch (e) {
+      return false;
+    }
+  }
 
   async function loadWasmEngine() {
     const scriptPath = '/camara.js';
@@ -48,7 +81,6 @@
   onMount(async () => {
     if (!browser) return;
 
-    // Inicialización de recursos de captura optimizada
     canvasThumb = document.createElement('canvas');
     canvasThumb.width = 100; canvasThumb.height = 100;
     ctxThumb = canvasThumb.getContext('2d', { alpha: false, desynchronized: true });
@@ -107,8 +139,6 @@
     
     if (results.faceLandmarks?.[0]) {
       const lms = results.faceLandmarks[0];
-      
-      // OPTIMIZACIÓN: Single-pass para Bounding Box y HEAP copy (Evita .map y .Math.min)
       let minX = 1, minY = 1, maxX = 0, maxY = 0;
       const heap = new Float32Array(wasmModule.HEAPF32.buffer, sharedBufferPtr, DIMS);
 
@@ -132,7 +162,6 @@
 
       const analysis = engine.processFrame(sharedBufferPtr, 478);
       
-      // Liveness optimizado
       const shapes = results.faceBlendshapes[0]?.categories;
       if (shapes) {
         let blinkScore = 0;
@@ -175,9 +204,18 @@
   async function checkBiometrics() {
     if (isProcessing) return;
     isProcessing = true;
-    status = "QUANTUM_MATCHING...";
+    status = "QUERYING_SQLITE_VAULT...";
     
-    const db = JSON.parse(localStorage.getItem("BIO_DB_V5") || "[]");
+    // CAMBIO: Obtenemos la base de datos desde el Backend
+    const db = await fetchBiometricDB();
+    
+    if (db.length === 0) {
+      status = "NO_PROFILES_FOUND";
+      addLog("DATABASE_EMPTY", "warn");
+      isProcessing = false;
+      return;
+    }
+
     let match = null;
     let minDistance = 999;
 
@@ -215,13 +253,32 @@
     rawPoseSamples.forEach((v, i) => tHeap.set(v, i * DIMS));
 
     const model = engine.trainModel(tPtr, rawPoseSamples.length, DIMS, crypto.randomUUID());
-    const db = JSON.parse(localStorage.getItem("BIO_DB_V5") || "[]");
-    db.push({ id: model.userId, thumb: captureThumb(), model: { mean: Array.from(model.mean), invCovariance: Array.from(model.invCovariance) } });
-    localStorage.setItem("BIO_DB_V5", JSON.stringify(db));
+    
+    const newUser = { 
+      id: model.userId, 
+      thumb: captureThumb(), 
+      model: { 
+        mean: Array.from(model.mean), 
+        invCovariance: Array.from(model.invCovariance) 
+      } 
+    };
+
+    // CAMBIO: Sincronización persistente con SQLite
+    const success = await syncProfileToServer(newUser);
+
     wasmModule._free(tPtr);
-    rawPoseSamples = []; isRegistering = false; 
-    status = "VAULT_SEALED";
-    addLog("PROFILE_SAVED", "success");
+    rawPoseSamples = []; 
+    isRegistering = false; 
+
+    if (success) {
+      status = "VAULT_SEALED_SQLITE";
+      addLog("REMOTE_PROFILE_SAVED", "success");
+    } else {
+      status = "SYNC_FAILED_LOCAL_ONLY";
+      addLog("BACKEND_OFFLINE", "warn");
+      // Fallback a localStorage por si acaso
+      localStorage.setItem("BIO_BACKUP", JSON.stringify(newUser));
+    }
   }
 
   onDestroy(() => { if (wasmModule && sharedBufferPtr) wasmModule._free(sharedBufferPtr); });
