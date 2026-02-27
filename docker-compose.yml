@@ -1,22 +1,24 @@
 services:
-  app:
+  backend:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: crow-nginx-app
+    container_name: crow-app
     ports:
-      - "${PORT_HOST:-443}:443"
-      - "80:80" 
+      - "${PORT_HTTP:-443}:443"
     volumes:
+      # CAMBIO: Usamos una carpeta local './data' en el host para la base de datos
       - ./data:/database
     restart: unless-stopped
-    # Add this section to resolve the warning
-    ulimits:
-      nofile:
-        soft: 4096
-        hard: 4096
     deploy:
       resources:
         limits:
-          memory: 64M 
-          cpus: '1'
+          memory: ${BACKEND_MEMORY_LIMIT:-32M}
+          cpus: '1' 
+        reservations:
+          memory: ${BACKEND_RESERVATIONS:-16M}
+    environment:
+      - LOG_LEVEL=info
+      # El binario buscará el archivo dentro de la ruta montada
+      - DB_PATH=/database/app.db
+
