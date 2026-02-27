@@ -38,43 +38,57 @@
   let rawPoseSamples: Float32Array[] = [];
   let anglesDone = $state({ left: false, right: false, up: false, down: false });
 
-  // --- INTEGRACIÓN BACKEND (SQLite Sync) ---
-  
+  // --- INTEGRACIÓN BACKEND (SQLite Vault) ---
   async function fetchBiometricDB() {
     try {
       const res = await fetch('/api/get-biometrics');
       if (!res.ok) throw new Error();
       const data = await res.json();
-      return data.map((u: any) => ({
-        ...u,
-        model: typeof u.model === 'string' ? JSON.parse(u.model) : u.model
-      }));
+      
+      return data.map((u: any) => {
+        // Mapeo: Maneja 'value_data' de SQLite o 'model' de la estructura JSON
+        const rawContent = u.value_data || u.model;
+        const parsed = typeof rawContent === 'string' ? JSON.parse(rawContent) : rawContent;
+        
+        return {
+          id: u.id || parsed.id,
+          key_name: u.key_name,
+          thumb: parsed.thumb,
+          model: parsed.model || parsed 
+        };
+      });
     } catch (e) {
       addLog("DB_FETCH_FAILED", "warn");
       return [];
     }
   }
 
-  async function syncProfileToServer(userData: any) {
+  async function syncProfileToDB(userData: any) {
     try {
-      const res = await fetch('/api/save-localstorage', {
+      const res = await fetch('/api/save-biometrics', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          key: `BIO_${userData.id}`,
-          value: JSON.stringify(userData) // El backend lo guardará en SQLite
+        body: JSON.stringify({ 
+          key: `BIO_${userData.id}`, 
+          value: JSON.stringify(userData) 
         })
       });
       return res.ok;
     } catch (e) {
+      addLog("SERVER_SYNC_FAILED", "warn");
       return false;
     }
   }
 
   async function loadWasmEngine() {
-    const scriptPath = '/camara.js';
+    const scriptPath = '/main.js'; 
     const wasmGlue = await import(/* @vite-ignore */ scriptPath);
-    return await wasmGlue.default({ locateFile: (path: string) => `/${path}` });
+    return await wasmGlue.default({ 
+      locateFile: (path: string) => {
+        if (path.endsWith('.wasm')) return '/main.wasm';
+        return `/${path}`;
+      }
+    });
   }
 
   onMount(async () => {
@@ -123,72 +137,54 @@
     }
   }
 
-  function captureThumb(): string {
-    if (ctxThumb && videoElement) {
-      ctxThumb.drawImage(videoElement, 490, 210, 300, 300, 0, 0, 100, 100);
-      return canvasThumb.toDataURL('image/webp', 0.7);
-    }
-    return "";
-  }
-
   function predict(faceLandmarker: any) {
     if (!videoElement || !wasmModule || !sharedBufferPtr) return;
-    
     const results = faceLandmarker.detectForVideo(videoElement, performance.now());
     
     if (results.faceLandmarks?.[0]) {
       const lms = results.faceLandmarks[0];
-      let minX = 1, minY = 1, maxX = 0, maxY = 0;
-      const heap = new Float32Array(wasmModule.HEAPF32.buffer, sharedBufferPtr, DIMS);
-
-      for (let i = 0; i < 478; i++) {
-        const pt = lms[i];
-        if (pt.x < minX) minX = pt.x; if (pt.x > maxX) maxX = pt.x;
-        if (pt.y < minY) minY = pt.y; if (pt.y > maxY) maxY = pt.y;
-        
-        const offset = i * 3;
-        heap[offset] = pt.x; 
-        heap[offset + 1] = pt.y; 
-        heap[offset + 2] = pt.z;
+      const flatData = new Float32Array(lms.length * 3);
+      for (let i = 0; i < lms.length; i++) {
+        flatData[i * 3] = lms[i].x;
+        flatData[i * 3 + 1] = lms[i].y;
+        flatData[i * 3 + 2] = lms[i].z;
       }
+      wasmModule.HEAPF32.set(flatData, sharedBufferPtr / 4);
+
+      const analysis = engine.processFrame(sharedBufferPtr, lms.length);
       
       facePos = {
-        x: (1 - minX) * videoWidth - ((maxX - minX) * videoWidth),
-        y: minY * videoHeight,
-        w: (maxX - minX) * videoWidth,
-        h: (maxY - minY) * videoHeight
+        x: (1 - analysis.minX) * videoWidth - ((analysis.maxX - analysis.minX) * videoWidth),
+        y: analysis.minY * videoHeight,
+        w: (analysis.maxX - analysis.minX) * videoWidth,
+        h: (analysis.maxY - analysis.minY) * videoHeight
       };
 
-      const analysis = engine.processFrame(sharedBufferPtr, 478);
-      
       const shapes = results.faceBlendshapes[0]?.categories;
       if (shapes) {
-        let blinkScore = 0;
-        for (let i = 0; i < shapes.length; i++) {
-            if (shapes[i].categoryName === 'eyeBlinkLeft' || shapes[i].categoryName === 'eyeBlinkRight') {
-                blinkScore += shapes[i].score;
-            }
-        }
-        const eyeBlink = (blinkScore / 2) > 0.45;
-        
-        if (eyeBlink && !isBlinking) {
+        const scoreL = shapes.find(s => s.categoryName === 'eyeBlinkLeft')?.score || 0;
+        const scoreR = shapes.find(s => s.categoryName === 'eyeBlinkRight')?.score || 0;
+        const blinkScore = (scoreL + scoreR) / 2;
+        const isCurrentlyBlinking = blinkScore > 0.45;
+
+        if (isCurrentlyBlinking && !isBlinking) {
           isBlinking = true; blinkCount++;
           addLog(`LIVENESS_BEEP_${blinkCount}`, "info");
           if (blinkCount >= 2) {
             if (isRegistering) finalizeRegistration();
             else if (!authorizedUser) checkBiometrics();
           }
-        } else if (!eyeBlink) isBlinking = false;
+        } else if (!isCurrentlyBlinking) isBlinking = false;
       }
 
-      if (isRegistering) handlePoseCapture(analysis.yaw, analysis.pitch, heap);
+      if (isRegistering) handlePoseCapture(analysis.yaw, analysis.pitch, sharedBufferPtr);
     }
     requestAnimationFrame(() => predict(faceLandmarker));
   }
 
-  function handlePoseCapture(yaw: number, pitch: number, heap: Float32Array) {
+  function handlePoseCapture(yaw: number, pitch: number, ptr: number) {
     const cap = (key: keyof typeof anglesDone) => {
-      rawPoseSamples.push(new Float32Array(heap));
+      rawPoseSamples.push(new Float32Array(wasmModule.HEAPF32.buffer, ptr, DIMS).slice());
       if (rawPoseSamples.length % 60 === 0) {
         anglesDone[key] = true;
         addLog(`VECTOR_${key.toUpperCase()}_CAPTURED`, "success");
@@ -206,39 +202,37 @@
     status = "QUERYING_SQLITE_VAULT...";
     
     const db = await fetchBiometricDB();
-    
     if (db.length === 0) {
       status = "NO_PROFILES_FOUND";
-      addLog("DATABASE_EMPTY", "warn");
       isProcessing = false;
       return;
     }
 
     let match = null;
     let minDistance = 999;
+    const mPtr = wasmModule._malloc(DIMS * 4);
+    const iPtr = wasmModule._malloc(DIMS * 4);
 
     for (const user of db) {
-      const mPtr = wasmModule._malloc(DIMS * 4);
-      const iPtr = wasmModule._malloc(DIMS * 4);
       wasmModule.HEAPF32.set(new Float32Array(user.model.mean), mPtr / 4);
       wasmModule.HEAPF32.set(new Float32Array(user.model.invCovariance), iPtr / 4);
-
       const dist = engine.calculateMahalanobis(sharedBufferPtr, mPtr, iPtr, DIMS);
       if (dist < minDistance) { minDistance = dist; match = user; }
-      wasmModule._free(mPtr); wasmModule._free(iPtr);
     }
 
+    wasmModule._free(mPtr);
+    wasmModule._free(iPtr);
     const rawScore = engine.getConfidenceScore(minDistance);
     precision = rawScore.toFixed(7);
 
-    if (match && rawScore >= 99.85) {
+    // Ajuste de Umbral a 95.00%
+    if (match && rawScore >= 95.00) {
       authorizedUser = match;
       userThumb = match.thumb;
       status = "ACCESS_GRANTED_ALPHA";
       addLog(`AUTH_SUCCESS: ${precision}%`, "success");
     } else {
-      authorizedUser = null;
-      status = rawScore > 99.0 ? "MARGINAL_CONFIDENCE_REJECT" : "SECURITY_BREACH_DETECTED";
+      status = "SECURITY_REJECT";
       addLog(`REJECTED: ${precision}%`, "warn");
     }
     isProcessing = false;
@@ -246,37 +240,35 @@
 
   async function finalizeRegistration() {
     status = "ENCRYPTING_VAULT...";
-    const tPtr = wasmModule._malloc(rawPoseSamples.length * DIMS * 4);
-    const tHeap = new Float32Array(wasmModule.HEAPF32.buffer, tPtr, rawPoseSamples.length * DIMS);
+    const tSize = rawPoseSamples.length * DIMS;
+    const tPtr = wasmModule._malloc(tSize * 4);
+    const tHeap = new Float32Array(wasmModule.HEAPF32.buffer, tPtr, tSize);
     rawPoseSamples.forEach((v, i) => tHeap.set(v, i * DIMS));
 
     const model = engine.trainModel(tPtr, rawPoseSamples.length, DIMS, crypto.randomUUID());
     
-    const newUser = { 
+    const success = await syncProfileToDB({ 
       id: model.userId, 
       thumb: captureThumb(), 
       model: { 
         mean: Array.from(model.mean), 
         invCovariance: Array.from(model.invCovariance) 
       } 
-    };
-
-    // --- SINCRONIZACIÓN EXCLUSIVA CON SERVIDOR ---
-    addLog("TRANSMITTING_TO_CORE...", "info");
-    const success = await syncProfileToServer(newUser);
+    });
 
     wasmModule._free(tPtr);
     rawPoseSamples = []; 
-    isRegistering = false; 
-    anglesDone = { left: false, right: false, up: false, down: false };
+    isRegistering = false;
+    status = success ? "VAULT_SEALED" : "SYNC_ERROR";
+    if (success) addLog("SQLITE_VAULT_UPDATED", "success");
+  }
 
-    if (success) {
-      status = "VAULT_SEALED_SQLITE";
-      addLog("REMOTE_PROFILE_SAVED", "success");
-    } else {
-      status = "CORE_SYNC_FAILED";
-      addLog("BACKEND_UNREACHABLE", "warn");
+  function captureThumb(): string {
+    if (ctxThumb && videoElement) {
+      ctxThumb.drawImage(videoElement, 490, 210, 300, 300, 0, 0, 100, 100);
+      return canvasThumb.toDataURL('image/webp', 0.7);
     }
+    return "";
   }
 
   onDestroy(() => { if (wasmModule && sharedBufferPtr) wasmModule._free(sharedBufferPtr); });
@@ -294,13 +286,13 @@
         </div>
         <div class="tag-data">
           <span class="user-id">ID: ALPHA_{authorizedUser.id.slice(0,4)}</span>
-          <span class="conf" class:high-safety={parseFloat(precision) >= 99.85}>
+          <span class="conf" class:high-safety={parseFloat(precision) >= 95.00}>
             {precision}% MATCH
           </span>
           <div class="accuracy-bar-container">
             <div 
               class="accuracy-fill" 
-              style="width: {precision}%; background: {parseFloat(precision) >= 99.85 ? '#0ff' : '#f00'};"
+              style="width: {precision}%; background: {parseFloat(precision) >= 95.00 ? '#0ff' : '#f00'};"
             ></div>
           </div>
         </div>
